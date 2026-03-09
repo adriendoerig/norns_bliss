@@ -10,8 +10,6 @@ defs.STP_SPEED_COL = 5
 defs.DROPPER_COL = 6
 defs.JUMP_COL = 7
 
-defs.ADDITIVE_KEY = {{16, 4}}
-
 defs.LEFT_RING_TOPRIGHT  = {8, 3}
 defs.RIGHT_RING_TOPRIGHT = {10, 1}
 
@@ -23,10 +21,15 @@ defs.LINK_PLAYHEADS_KEY = {{11, 4},{11, 5}, {12, 4},{12, 5}}
 defs.SEND_1_TO_2_KEY = {{8, 1}, {8, 2}, {8, 3}, {9, 1}, {9, 2}, {10, 1}}
 defs.SEND_2_TO_1_KEY = {{13, 8}, {14, 8}, {14, 7}, {15, 8}, {15, 7}, {15, 6}}
 
-defs.REVERSE_KEY = {{16, 7}}
-defs.SHORT_RATE_SLEW_KEY = {16,6}
-defs.LONG_RATE_SLEW_KEY = {16,5}
+defs.MOTION1_KEY = {8, 8}
+defs.MOTION2_KEY = {15, 1}
+
 defs.REC_KEY = {16,8}
+defs.REVERSE_KEY = {{16, 7}}
+defs.RATE_SLEW_KEY = {16,6}
+defs.ADDITIVE_KEY = {{16, 5}}
+defs.SNAPSHOT_KEY = {16,4}
+defs.MOD_SHIFT_KEY = {16, 3}
 defs.SHIFT_KEY = {16, 2}
 defs.CLEAR_KEY = {16,1}
 
@@ -105,15 +108,26 @@ defs.DROPPER_VALUES = {
   [8] = 0.0
 }
 
-defs.JUMP_VALUES = {
-  [1] = 32,
-  [2] = 16,
-  [3] = 8,
-  [4] = 6,
-  [5] = 4,
-  [6] = 3,
-  [7] = 2,
-  [8] = 0
+function defs_is_jump_target_row(y)
+  return y >= 5 and y <= 8
+end
+
+function defs_is_jump_trigger_row(y)
+  return y >= 1 and y <= 4
+end
+
+defs.JUMP_TARGET_VALUES = {
+  [8] = 4,
+  [7] = 8,
+  [6] = 16,
+  [5] = 32
+}
+
+defs.JUMP_TRIGGER_VALUES = {
+  [4] = 0,   -- never
+  [3] = 4,   -- every 1/4 loop
+  [2] = 8,   -- every 1/8 loop
+  [1] = 32   -- every 1/32 loop
 }
 
 -- ---------- ring geometry ----------
@@ -124,8 +138,13 @@ defs.TAPEHEAD_RING_PTS = {
 }
 
 defs.TAPEHEAD_RING_LED_OFFSETS = {
-  2, 1, 1, 0, 0, -1, -1, -2,
-  -2, -1, -1, 0, 0, 1, 1, 2
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0
+}
+
+defs.RING_OVERLAP_OWNERS = {
+  ["10,3"] = 2, -- upper-right crossing belongs to right ring
+  ["13,6"] = 1, -- bottom-left crossing belongs to left ring
 }
 
 return defs

@@ -16,37 +16,371 @@ local loopers = {
 
 local link_playheads = false
 
-local send_1_to_2 = 0.0
-local send_2_to_1 = 0.0
+local send_1_to_2 = 0.707 -- default is quite high
+local send_2_to_1 = 0.707 -- default is quite high
 local send_1_to_2_enabled = false
 local send_2_to_1_enabled = false
+
+local snapshot_1 = nil
+local snapshot_2 = nil
+local snapshot_mode_active = false
+local snapshot_mode_delete = false
+local snapshot_mode_overwrite = false
+local snapshot_key_held = false
+local snapshot_flash_kind = nil
+local snapshot_flash_token = 0
+
+local shift_held = false
+local mod_shift_held = false
+
+local k1_held = false
+local k2_held = false
+local k3_held = false
+
+local k1_consumed = false
+local k2_consumed = false
+local k3_consumed = false
+
+local k1_down_time = nil
+local k2_down_time = nil
+local k3_down_time = nil
+
+local KEY_INFO_DELAY = 0.5
+
+local trigger_snapshot_flash
+local refresh_routing
+local restore_performance_state
+
+local function long_hold_shown(down_time)
+  return down_time ~= nil and (util.time() - down_time >= KEY_INFO_DELAY)
+end
 
 
 -- -------- helper functions --------
 
 local function redraw_all()
-  looper_ui.redraw(
-    loopers, g, a, link_playheads,
-    send_1_to_2, send_2_to_1,
-    send_1_to_2_enabled, send_2_to_1_enabled,
-    arc_page
-  )
+  redraw()
 
   looper_ui.grid_redraw(
     g, loopers, link_playheads,
     send_1_to_2, send_2_to_1,
     send_1_to_2_enabled, send_2_to_1_enabled,
-    shift_held
+    shift_held, mod_shift_held,
+    snapshot_1 ~= nil, snapshot_2 ~= nil,
+    snapshot_flash_kind
   )
 
   looper_ui.arc_redraw(a, loopers, arc_page, send_1_to_2, send_2_to_1)
 end
 
 local function active_looper()
+  for _, L in ipairs(loopers) do
+    if L.selected then
+      return L
+    end
+  end
   return loopers[1]
 end
 
-local function refresh_routing()
+local function capture_looper_state(L)
+  return {
+    selected = L.selected,
+
+    has_loop = L.has_loop,
+    is_overdubbing = L.is_overdubbing,
+
+    drywet = L.drywet,
+    dry_level = L.dry_level,
+    wet_level = L.wet_level,
+
+    additive_mode = L.additive_mode,
+    overdub = L.overdub,
+
+    rate = L.rate,
+    rate_slew_mode = L.rate_slew_mode or 0,
+    is_reversed = L.is_reversed,
+
+    dropper_amt = L.dropper_amt,
+    dropper_gain = L.dropper_gain,
+    dropper_target_gain = L.dropper_target_gain,
+    dropper_timer = L.dropper_timer,
+
+    tape_age = L.tape_age,
+
+    dj_filter_freq = L.dj_filter_freq,
+    dj_filter_res = L.dj_filter_res,
+
+    jump_div = L.jump_div,
+    jump_trigger_div = L.jump_trigger_div,
+    last_jump_step = L.last_jump_step,
+
+    loop_start = L.loop_start,
+    loop_end = L.loop_end,
+    full_loop_start = L.full_loop_start,
+    full_loop_end = L.full_loop_end,
+    play_pos = L.play_pos,
+
+    crop_start = L.crop_start,
+    crop_len = L.crop_len,
+    crop_wraps = L.crop_wraps,
+  }
+end
+
+local function capture_performance_state()
+  return {
+    loopers = {
+      capture_looper_state(loopers[1]),
+      capture_looper_state(loopers[2]),
+    },
+
+    link_playheads = link_playheads,
+
+    send_1_to_2 = send_1_to_2,
+    send_2_to_1 = send_2_to_1,
+    send_1_to_2_enabled = send_1_to_2_enabled,
+    send_2_to_1_enabled = send_2_to_1_enabled,
+  }
+end
+
+local function copy_state(state)
+  return tab.deepcopy(state)
+end
+
+local function get_current_state_copy()
+  return copy_state(capture_performance_state())
+end
+
+local function restore_looper_state(L, s)
+  L.selected = s.selected
+
+  L.has_loop = s.has_loop
+  L.is_overdubbing = s.is_overdubbing
+
+  L.drywet = s.drywet
+  L.dry_level = s.dry_level
+  L.wet_level = s.wet_level
+
+  L.additive_mode = s.additive_mode
+  L.overdub = s.overdub
+
+  L.rate = s.rate
+  L.rate_slew_mode = s.rate_slew_mode or 0
+  L.is_reversed = s.is_reversed
+
+  L.dropper_amt = s.dropper_amt
+  L.dropper_gain = s.dropper_gain or 1.0
+  L.dropper_target_gain = s.dropper_target_gain or 1.0
+  L.dropper_timer = s.dropper_timer or 0.0
+
+  L.tape_age = s.tape_age
+
+  L.dj_filter_freq = s.dj_filter_freq
+  L.dj_filter_res = s.dj_filter_res
+
+  L.jump_div = s.jump_div
+  L.jump_trigger_div = s.jump_trigger_div
+  L.last_jump_step = s.last_jump_step
+
+  L.full_loop_start = s.full_loop_start
+  L.full_loop_end = s.full_loop_end
+  L.crop_start = s.crop_start
+  L.crop_len = s.crop_len
+  L.crop_wraps = s.crop_wraps
+
+  L.loop_start = s.loop_start
+  L.loop_end = s.loop_end
+  L.play_pos = s.play_pos
+
+  -- clear transient UI-only ring state
+  L.held_ring_points = {}
+  L.ring_crop_happened = false
+  L.crop_ring_start_idx = nil
+  L.crop_ring_end_idx = nil
+
+  -- restore softcut loop bounds and positions
+  softcut.loop_start(L.play_voice, L.loop_start)
+  softcut.loop_end(L.play_voice, L.loop_end)
+  softcut.loop_start(L.write_voice, L.loop_start)
+  softcut.loop_end(L.write_voice, L.loop_end)
+
+  softcut.position(L.play_voice, L.play_pos)
+  softcut.position(L.write_voice, L.play_pos)
+
+  if L.has_loop then
+    softcut.play(L.play_voice, 1)
+    softcut.play(L.write_voice, 1)
+  else
+    softcut.play(L.play_voice, 0)
+    softcut.play(L.write_voice, 0)
+  end
+
+  -- do not restore active recording; just restore passive state
+  L.is_recording = false
+  L.rec_start_time = 0
+
+  if L.is_overdubbing then
+    looper_engine.apply_write_mode(L)
+  else
+    L.is_overdubbing = false
+    softcut.rec(L.play_voice, 0)
+    softcut.rec(L.write_voice, 0)
+    softcut.rec_level(L.play_voice, 0.0)
+    softcut.rec_level(L.write_voice, 0.0)
+    softcut.pre_level(L.play_voice, 1.0)
+    softcut.pre_level(L.write_voice, 1.0)
+    softcut.level_cut_cut(L.play_voice, L.write_voice, 0.0)
+  end
+
+  looper_engine.update_phase_quant(L)
+  looper_engine.apply_rate(L)
+  looper_engine.apply_rate_slew(L)
+  looper_engine.set_dj_filter_rq(L, L.dj_filter_res)
+  looper_engine.set_dj_filter_freq(L, L.dj_filter_freq)
+  looper_engine.update_output_mix(L)
+end
+
+restore_performance_state = function (state)
+  if state == nil then return end
+
+  restore_looper_state(loopers[1], state.loopers[1])
+  restore_looper_state(loopers[2], state.loopers[2])
+
+  link_playheads = state.link_playheads
+
+  send_1_to_2 = state.send_1_to_2
+  send_2_to_1 = state.send_2_to_1
+  send_1_to_2_enabled = state.send_1_to_2_enabled
+  send_2_to_1_enabled = state.send_2_to_1_enabled
+
+  refresh_routing()
+  redraw_all()
+end
+
+local function state_deepcopy(x)
+  if type(x) ~= "table" then return x end
+  local out = {}
+  for k, v in pairs(x) do
+    out[state_deepcopy(k)] = state_deepcopy(v)
+  end
+  return out
+end
+
+local function snapshot_store(slot)
+  local state = state_deepcopy(capture_performance_state())
+  if slot == 1 then
+    snapshot_1 = state
+  elseif slot == 2 then
+    snapshot_2 = state
+  end
+  trigger_snapshot_flash("store")
+end
+
+local function snapshot_recall(slot)
+  if slot == 1 and snapshot_1 ~= nil then
+    restore_performance_state(state_deepcopy(snapshot_1))
+    trigger_snapshot_flash("recall")
+  elseif slot == 2 and snapshot_2 ~= nil then
+    restore_performance_state(state_deepcopy(snapshot_2))
+    trigger_snapshot_flash("recall")
+  end
+end
+
+local function snapshot_clear(slot)
+  if slot == 1 then
+    snapshot_1 = nil
+  elseif slot == 2 then
+    snapshot_2 = nil
+  end
+  trigger_snapshot_flash("delete")
+end
+
+local function snapshot_exists(slot)
+  if slot == 1 then
+    return snapshot_1 ~= nil
+  elseif slot == 2 then
+    return snapshot_2 ~= nil
+  end
+  return false
+end
+
+local function snapshot_store_or_recall(slot)
+  if snapshot_exists(slot) then
+    snapshot_recall(slot)
+  else
+    snapshot_store(slot)
+  end
+end
+
+local function snapshot_slot_from_modifier()
+  if snapshot_key_held and mod_shift_held and not shift_held then
+    return 1
+  elseif snapshot_key_held and shift_held and not mod_shift_held then
+    return 2
+  end
+  return nil
+end
+
+local function clear_snapshot_modes()
+  snapshot_mode_delete = false
+  snapshot_mode_overwrite = false
+end
+
+local function try_snapshot_mode_action()
+  local slot = snapshot_slot_from_modifier()
+  if slot == nil then return false end
+
+  if snapshot_mode_delete then
+    snapshot_clear(slot)
+  elseif snapshot_mode_overwrite then
+    local state = state_deepcopy(capture_performance_state())
+    if slot == 1 then
+      snapshot_1 = state
+    elseif slot == 2 then
+      snapshot_2 = state
+    end
+    trigger_snapshot_flash("overwrite")
+  else
+    snapshot_store_or_recall(slot)
+  end
+
+  clear_snapshot_modes()
+  redraw_all()
+  return true
+end
+
+trigger_snapshot_flash = function(kind)
+  snapshot_flash_kind = kind
+  snapshot_flash_token = snapshot_flash_token + 1
+  local my_token = snapshot_flash_token
+
+  redraw_all()
+
+  clock.run(function()
+    if kind == "overwrite" then
+      clock.sleep(0.08)
+      if snapshot_flash_token ~= my_token then return end
+      snapshot_flash_kind = nil
+      redraw_all()
+
+      clock.sleep(0.06)
+      if snapshot_flash_token ~= my_token then return end
+      snapshot_flash_kind = "overwrite_2"
+      redraw_all()
+
+      clock.sleep(0.08)
+      if snapshot_flash_token ~= my_token then return end
+      snapshot_flash_kind = nil
+      redraw_all()
+    else
+      clock.sleep(0.14)
+      if snapshot_flash_token ~= my_token then return end
+      snapshot_flash_kind = nil
+      redraw_all()
+    end
+  end)
+end
+
+refresh_routing = function()
   looper_engine.update_all_routing(
     loopers,
     send_1_to_2,
@@ -71,58 +405,292 @@ local function reset_all()
   send_2_to_1 = 0.0
   send_1_to_2_enabled = false
   send_2_to_1_enabled = false
+  
+  snapshot_1 = nil
+  snapshot_2 = nil
 
   refresh_routing()
   redraw_all()
 end
 
+local function clear_modifiers_all()
+  for _, L in ipairs(loopers) do
+    looper_engine.clear_modifiers(L)
+  end
+
+  link_playheads = false
+  send_1_to_2 = 0.0
+  send_2_to_1 = 0.0
+  send_1_to_2_enabled = false
+  send_2_to_1_enabled = false
+
+  refresh_routing()
+  redraw_all()
+end
+
+local function stepped_speed_targets()
+  return {0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0}
+end
+
+local function apply_free_speed(L, d)
+  L.rate = util.clamp(L.rate + d * 0.005, -4.0, 4.0)
+
+  if math.abs(L.rate) < 0.001 then
+    L.rate = 0
+  end
+
+  L.is_reversed = (L.rate < 0)
+  looper_engine.apply_rate(L)
+end
+
+local function apply_stepped_speed(L, d)
+  local targets = stepped_speed_targets()
+
+  local sign = (L.rate < 0) and -1 or 1
+  local mag = math.abs(L.rate)
+  if mag < 0.001 then mag = 1.0 end
+
+  local best_i = 1
+  local best_d = math.huge
+  for i, v in ipairs(targets) do
+    local dd = math.abs(v - mag)
+    if dd < best_d then
+      best_d = dd
+      best_i = i
+    end
+  end
+
+  if d > 0 then
+    best_i = math.min(#targets, best_i + 1)
+  elseif d < 0 then
+    best_i = math.max(1, best_i - 1)
+  end
+
+  L.rate = sign * targets[best_i]
+  L.is_reversed = (L.rate < 0)
+  looper_engine.apply_rate(L)
+end
+
+local function adjust_selected_drywet(d)
+  looper_engine.for_each_selected(loopers, function(L)
+    looper_engine.set_drywet(L, L.drywet + d * 0.01)
+  end)
+end
+
+local function adjust_selected_overdub(d)
+  looper_engine.for_each_selected(loopers, function(L)
+    looper_engine.set_overdub(L, L.overdub + d * 0.04)
+  end)
+  refresh_routing()
+end
+
+local function adjust_selected_tape(d)
+  looper_engine.for_each_selected(loopers, function(L)
+    looper_engine.set_tape_age(L, L.tape_age + d * 0.04)
+    looper_engine.apply_rate(L)
+  end)
+end
+
+local function adjust_selected_dropper(d)
+  looper_engine.for_each_selected(loopers, function(L)
+    looper_engine.set_dropper_amt(L, L.dropper_amt + d * 0.04)
+  end)
+end
+
+local function move_playhead_for_looper(idx, d)
+  local L = loopers[idx]
+  looper_engine.move_crop(L, d * 2 / (64 * 4))
+  if idx == 1 and link_playheads then
+    sync_linked_playheads()
+  end
+end
+
+local function change_crop_len_for_looper(idx, d)
+  local L = loopers[idx]
+  local frac = looper_engine.get_crop_fraction(L)
+  frac = frac + d * 0.004
+  looper_engine.set_crop_fraction(L, frac)
+  if idx == 1 and link_playheads then
+    sync_linked_playheads()
+  end
+end
+
+local function apply_stepped_speed_for_looper(idx, d)
+  apply_stepped_speed(loopers[idx], d)
+end
+
+local function apply_free_speed_for_looper(idx, d)
+  apply_free_speed(loopers[idx], d)
+end
+
+local function all_keys_held()
+  return k1_held and k2_held and k3_held
+end
+
 function key(n, z)
-  if z ~= 1 then return end
+  if n == 1 then
+    if z == 1 then
+      k1_held = true
+      k1_consumed = false
+      k1_down_time = util.time()
+    else
+      k1_held = false
+      k1_down_time = nil
+    end
+    redraw()
+    return
+  end
 
   if n == 2 then
-    looper_engine.for_each_selected(loopers, function(L)
-      looper_engine.toggle(L)
-    end)
-    redraw_all()
-  elseif n == 3 then
-    looper_engine.for_each_selected(loopers, function(L)
-      looper_engine.clear_loop(L)
-    end)
-    redraw_all()
+    if z == 1 then
+      k2_held = true
+      k2_consumed = false
+      k2_down_time = util.time()
+
+      if all_keys_held() then
+        k1_consumed = true
+        k2_consumed = true
+        k3_consumed = true
+        reset_all()
+        redraw()
+        return
+      end
+
+      if k1_held then
+        k1_consumed = true
+        k2_consumed = true
+        loopers[1].selected = not loopers[1].selected
+        redraw()
+        return
+      end
+
+      if k3_held then
+        k2_consumed = true
+        k3_consumed = true
+        looper_engine.for_each_selected(loopers, function(L)
+          looper_engine.toggle_additive_mode(L)
+        end)
+        refresh_routing()
+        redraw()
+        return
+      end
+    else
+      local suppress_tap = k2_consumed or long_hold_shown(k2_down_time)
+      k2_held = false
+      k2_down_time = nil
+
+      if not suppress_tap then
+        looper_engine.for_each_selected(loopers, function(L)
+          looper_engine.toggle(L)
+        end)
+        refresh_routing()
+        redraw()
+      else
+        redraw()
+      end
+    end
+    return
+  end
+
+  if n == 3 then
+    if z == 1 then
+      k3_held = true
+      k3_consumed = false
+      k3_down_time = util.time()
+
+      if all_keys_held() then
+        k1_consumed = true
+        k2_consumed = true
+        k3_consumed = true
+        reset_all()
+        redraw()
+        return
+      end
+
+      if k1_held then
+        k1_consumed = true
+        k3_consumed = true
+        loopers[2].selected = not loopers[2].selected
+        redraw()
+        return
+      end
+
+      if k2_held then
+        k2_consumed = true
+        k3_consumed = true
+        looper_engine.for_each_selected(loopers, function(L)
+          looper_engine.toggle_additive_mode(L)
+        end)
+        refresh_routing()
+        redraw()
+        return
+      end
+    else
+      local suppress_tap = k3_consumed or long_hold_shown(k3_down_time)
+      k3_held = false
+      k3_down_time = nil
+
+      if not suppress_tap then
+        looper_engine.for_each_selected(loopers, function(L)
+          looper_engine.clear_loop(L)
+        end)
+        refresh_routing()
+        redraw()
+      else
+        redraw()
+      end
+    end
+    return
   end
 end
 
 function enc(n, d)
   if n == 1 then
-    local delta = d * 0.01
-
-    if send_1_to_2_enabled then
-      send_1_to_2 = util.clamp(send_1_to_2 + delta, 0.0, 1.0)
+    if k1_held then
+      k1_consumed = true
+      adjust_selected_overdub(d)
+    elseif k2_held then
+      k2_consumed = true
+      adjust_selected_tape(d)
+    elseif k3_held then
+      k3_consumed = true
+      adjust_selected_dropper(d)
+    else
+      adjust_selected_drywet(d)
     end
-
-    if send_2_to_1_enabled then
-      send_2_to_1 = util.clamp(send_2_to_1 + delta, 0.0, 1.0)
-    end
-
-    refresh_routing()
-    redraw_all()
     return
   end
+
   if n == 2 then
-    looper_engine.for_each_selected(loopers, function(L)
-      looper_engine.set_drywet(L, L.drywet + d * 0.01)
-    end)
-    redraw_all()
-  elseif n == 3 then
-    looper_engine.for_each_selected(loopers, function(L)
-      local old_rate = L.rate
-      L.rate = util.clamp(L.rate + d * 0.01, -2.0, 2.0)
-      if old_rate * L.rate < 0 then
-        L.is_reversed = not L.is_reversed
-      end
-      looper_engine.apply_rate(L)
-    end)
-    redraw_all()
+    if k1_held then
+      k1_consumed = true
+      change_crop_len_for_looper(1, d)
+    elseif k2_held then
+      k2_consumed = true
+      apply_stepped_speed_for_looper(1, d)
+    elseif k3_held then
+      k3_consumed = true
+      apply_free_speed_for_looper(1, d)
+    else
+      move_playhead_for_looper(1, d)
+    end
+    return
+  end
+
+  if n == 3 then
+    if k1_held then
+      k1_consumed = true
+      change_crop_len_for_looper(2, d)
+    elseif k2_held then
+      k2_consumed = true
+      apply_stepped_speed_for_looper(2, d)
+    elseif k3_held then
+      k3_consumed = true
+      apply_free_speed_for_looper(2, d)
+    else
+      move_playhead_for_looper(2, d)
+    end
+    return
   end
 end
 
@@ -251,18 +819,28 @@ local function grid_key(x, y, z)
   end
   
   if x == defs.JUMP_COL and z == 1 then
-    local val = defs.JUMP_VALUES[y]
-    if val ~= nil then
+    local target_val = defs.JUMP_TARGET_VALUES[y]
+    local trigger_val = defs.JUMP_TRIGGER_VALUES[y]
+  
+    if target_val ~= nil then
       looper_engine.for_each_selected(loopers, function(LL)
-        looper_engine.set_jump_div(LL, val)
+        looper_engine.set_jump_div(LL, target_val)
       end)
       redraw_all()
+      return
     end
-    return
+  
+    if trigger_val ~= nil then
+      looper_engine.for_each_selected(loopers, function(LL)
+        looper_engine.set_jump_trigger_div(LL, trigger_val)
+      end)
+      redraw_all()
+      return
+    end
   end
   
   local left_ring_idx = looper_ui.grid_ring_hit(
-    x, y,
+    x, y, 1,
     defs.LEFT_RING_TOPRIGHT[1], defs.LEFT_RING_TOPRIGHT[2]
   )
 
@@ -273,7 +851,7 @@ local function grid_key(x, y, z)
   end
 
   local right_ring_idx = looper_ui.grid_ring_hit(
-    x, y,
+    x, y, 2,
     defs.RIGHT_RING_TOPRIGHT[1], defs.RIGHT_RING_TOPRIGHT[2]
   )
 
@@ -323,6 +901,46 @@ local function grid_key(x, y, z)
     redraw_all()
     return
   end
+  
+  if x == defs.MOTION1_KEY[1] and y == defs.MOTION1_KEY[2] and z == 1 then
+    local L = loopers[1]
+  
+    if shift_held then
+      looper_engine.clear_motion(L)
+    elseif mod_shift_held then
+      if L.motion_has_data then
+        L.motion_playback = not L.motion_playback
+        if L.motion_playback then
+          L.motion_last_step = nil
+        end
+      end
+    else
+      looper_engine.motion_key_press(L)
+    end
+  
+    redraw_all()
+    return
+  end
+  
+  if x == defs.MOTION2_KEY[1] and y == defs.MOTION2_KEY[2] and z == 1 then
+    local L = loopers[2]
+  
+    if shift_held then
+      looper_engine.clear_motion(L)
+    elseif mod_shift_held then
+      if L.motion_has_data then
+        L.motion_playback = not L.motion_playback
+        if L.motion_playback then
+          L.motion_last_step = nil
+        end
+      end
+    else
+      looper_engine.motion_key_press(L)
+    end
+  
+    redraw_all()
+    return
+  end
 
   if looper_ui.grid_match_any(x, y, defs.ADDITIVE_KEY) and z == 1 then
     looper_engine.for_each_selected(loopers, function(LL)
@@ -342,53 +960,105 @@ local function grid_key(x, y, z)
     return
   end
 
-  if x == defs.SHORT_RATE_SLEW_KEY[1] and y == defs.SHORT_RATE_SLEW_KEY[2] and z == 1 then
+  if x == defs.RATE_SLEW_KEY[1] and y == defs.RATE_SLEW_KEY[2] and z == 1 then
     looper_engine.for_each_selected(loopers, function(LL)
-      LL.short_rate_slew = not LL.short_rate_slew
-      LL.long_rate_slew = false
+      LL.rate_slew_mode = (LL.rate_slew_mode + 1) % 3
       looper_engine.apply_rate_slew(LL)
     end)
     redraw_all()
     return
   end
 
-  if x == defs.LONG_RATE_SLEW_KEY[1] and y == defs.LONG_RATE_SLEW_KEY[2] and z == 1 then
-    looper_engine.for_each_selected(loopers, function(LL)
-      LL.short_rate_slew = false
-      LL.long_rate_slew = not LL.long_rate_slew
-      looper_engine.apply_rate_slew(LL)
-    end)
+  if x == defs.REC_KEY[1] and y == defs.REC_KEY[2] then
+    if snapshot_key_held then
+      if z == 1 then
+        snapshot_mode_overwrite = true
+        snapshot_mode_delete = false
+      else
+        snapshot_mode_overwrite = false
+      end
+      redraw_all()
+      return
+    end
+  
+    if z == 1 then
+      looper_engine.for_each_selected(loopers, function(LL)
+        looper_engine.toggle(LL)
+      end)
+      refresh_routing()
+      redraw_all()
+      return
+    end
+  end
+  
+  if x == defs.SNAPSHOT_KEY[1] and y == defs.SNAPSHOT_KEY[2] then
+    snapshot_key_held = (z == 1)
+  
+    if z == 1 then
+      clear_snapshot_modes()
+    else
+      clear_snapshot_modes()
+    end
+  
     redraw_all()
     return
   end
-
-  if x == defs.REC_KEY[1] and y == defs.REC_KEY[2] and z == 1 then
-    looper_engine.for_each_selected(loopers, function(LL)
-      looper_engine.toggle(LL)
-    end)
-    refresh_routing()
+  
+  if x == defs.MOD_SHIFT_KEY[1] and y == defs.MOD_SHIFT_KEY[2] then
+    mod_shift_held = (z == 1)
+  
+    if z == 1 and snapshot_key_held then
+      if try_snapshot_mode_action() then
+        return
+      end
+    end
+  
     redraw_all()
     return
   end
   
   if x == defs.SHIFT_KEY[1] and y == defs.SHIFT_KEY[2] then
     shift_held = (z == 1)
+  
+    if z == 1 and snapshot_key_held then
+      if try_snapshot_mode_action() then
+        return
+      end
+    end
+  
     redraw_all()
     return
   end
 
-  if x == defs.CLEAR_KEY[1] and y == defs.CLEAR_KEY[2] and z == 1 then
-    if shift_held then
-      reset_all()
-    else
-      looper_engine.for_each_selected(loopers, function(LL)
-        looper_engine.clear_loop(LL)
-      end)
-      refresh_routing()
+  if x == defs.CLEAR_KEY[1] and y == defs.CLEAR_KEY[2] then
+    if snapshot_key_held then
+      if z == 1 then
+        snapshot_mode_delete = true
+        snapshot_mode_overwrite = false
+      else
+        snapshot_mode_delete = false
+      end
       redraw_all()
+      return
     end
-    return
+  
+    if z == 1 then
+      if shift_held then
+        reset_all()
+      elseif mod_shift_held then
+        clear_modifiers_all()
+      else
+        looper_engine.for_each_selected(loopers, function(LL)
+          looper_engine.clear_loop(LL)
+          looper_engine.clear_motion(LL)
+        end)
+        refresh_routing()
+        redraw_all()
+      end
+      return
+    end
   end
+  
 end
 
 --------------------------------------------
@@ -401,11 +1071,29 @@ local function arc_key(n, z)
   redraw_all()
 end
 
+local function snap_rate_with_dents(r)
+  local targets = {
+    -4.0, -3.0, -2.0, -1.5, -1.0, -0.75, -0.5, -0.25, 
+    0,
+     0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0
+  }
+
+  local snap_width = 0.005
+
+  for _, t in ipairs(targets) do
+    if math.abs(r - t) <= snap_width then
+      return t
+    end
+  end
+
+  return r
+end
+
 local function arc_delta(n, d)
   if arc_page == 1 then
     if n == 1 then
       local L = loopers[1]
-      looper_engine.move_crop(L, d / (64 * 4))
+      looper_engine.move_crop(L, d * 0.5 / (64 * 4))
       if link_playheads then
         sync_linked_playheads()
       end
@@ -421,7 +1109,7 @@ local function arc_delta(n, d)
 
     elseif n == 3 then
       local L = loopers[2]
-      looper_engine.move_crop(L, d / (64 * 4))
+      looper_engine.move_crop(L, d * 0.5 / (64 * 4))
 
     elseif n == 4 then
       local L = loopers[2]
@@ -433,22 +1121,24 @@ local function arc_delta(n, d)
   elseif arc_page == 2 then
     if n == 1 then
       local L = loopers[1]
-      L.rate = util.clamp(L.rate + d * 0.01, -4.0, 4.0)
+      L.rate = util.clamp(L.rate + d * 0.005, -4.0, 4.0)
+      L.rate = snap_rate_with_dents(L.rate)
 
-      if math.abs(L.rate) < 0.001 then
-        L.rate = 0.001
-      end
+      -- if math.abs(L.rate) < 0.001 then
+      --   L.rate = 0.001
+      -- end
 
       L.is_reversed = (L.rate < 0)
       looper_engine.apply_rate(L)
 
     elseif n == 2 then
       local L = loopers[2]
-      L.rate = util.clamp(L.rate + d * 0.01, -4.0, 4.0)
+      L.rate = util.clamp(L.rate + d * 0.005, -4.0, 4.0)
+      L.rate = snap_rate_with_dents(L.rate)
 
-      if math.abs(L.rate) < 0.001 then
-        L.rate = 0.001
-      end
+      -- if math.abs(L.rate) < 0.001 then
+      --   L.rate = 0.001
+      -- end
 
       L.is_reversed = (L.rate < 0)
       looper_engine.apply_rate(L)
@@ -474,7 +1164,7 @@ local function arc_delta(n, d)
     end
   end
 
-  redraw_all()
+  looper_ui.arc_redraw(a, loopers, arc_page, send_1_to_2, send_2_to_1)
 end
 
 --------------------------------------------
@@ -490,7 +1180,7 @@ function init()
   softcut.poll_start_phase()
 
   viz_metro = metro.init()
-  viz_metro.time = 1/30
+  viz_metro.time = 1/20
   viz_metro.event = function()
     for _, L in ipairs(loopers) do
       looper_engine.apply_tape_warble(L, viz_metro.time)
@@ -519,10 +1209,13 @@ end
 
 function redraw()
   looper_ui.redraw(
-    loopers, g, a, link_playheads,
+    loopers, g, a,
+    link_playheads,
     send_1_to_2, send_2_to_1,
     send_1_to_2_enabled, send_2_to_1_enabled,
-    arc_page
+    arc_page,
+    k1_held, k2_held, k3_held,
+    k1_down_time, k2_down_time, k3_down_time
   )
 end
 
