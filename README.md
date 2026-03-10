@@ -4,13 +4,13 @@
 
 It takes inspiration from the Chase Bliss Blooper and Instruō Lubadh, but it is not a straight clone. The idea is to treat two loopers as a small coupled ecosystem: you can record into either one, crop them from grid or arc, alter their speed and direction, add tape-style instability, inject random jumps, overdub additively, send one into the other, store snapshots, and capture motion over one loop.
 
-The script is designed to feel like an instrument rather than a workstation: fast access, strong visual identity, and a small set of gestures that combine well.
+The script is designed to feel like an instrument rather than a list of parameters: fast access, a clear visual identity, a thought-out set of gestures that combine well and, importantly, no menu diving. I didn't even include editable parameters in norns's parameters menu. The aim is to combine the immediacy of a guitar pedal with the flexibility of norns/grid/arc. This is really made with grid in mind, although you should be able to have fun with just norns too. Arc offers easy access to a bunch of parameters that do improve the experience, but is not essential.
 
 ## Requirements
 
 - norns
-- monome grid (128)
-- monome arc
+- monome grid (128) - recommended
+- monome arc - cool addition
 
 ## Main features
 
