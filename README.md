@@ -61,7 +61,8 @@ Most parameter changes apply to the **selected looper(s)**. You can select one l
 - **K3 tap**: clear selected looper(s)
 - **K1 + K2**: toggle selection of looper 1
 - **K1 + K3**: toggle selection of looper 2
-- **K2 + K3**: toggle additive mode on selected looper(s)
+- **K2(hold) + K3**: toggle additive mode on looper 2
+- **K3(hold) + K2**: toggle additive mode on looper 1
 - **K1 + K2 + K3**: reset everything
 
 ### Encoders
@@ -124,9 +125,11 @@ Gestures:
 - **(8,8)**: motion capture for looper 1
 - **(15,1)**: motion capture for looper 2
 
-### Right utility column
+Linked playhead is also show as an infinity sign on the top right of norns's screen.
+Send direction is shown there using arrows.
+Motion capture is represented by two dots (one per looper).
 
-From top to bottom:
+### Utility column 16
 
 - **16,8**: record / stop selected looper(s)
 - **16,7**: reverse
@@ -145,7 +148,9 @@ From top to bottom:
 
 ### Snapshots
 
-Snapshot gestures are intentionally strict:
+Snapshot save everything except the audio (modifiers, loop location, crops, additive mode toggle, sends, etc). There are two slots which can be instantly stored and recalled.
+
+Gestures are intentionally strict (i.e. order matters!):
 
 - **snapshot -> mod shift**: slot 1 store / recall
 - **snapshot -> shift**: slot 2 store / recall
@@ -154,18 +159,20 @@ Snapshot gestures are intentionally strict:
 - **snapshot -> clear -> mod shift**: delete slot 1
 - **snapshot -> clear -> shift**: delete slot 2
 
-Order matters: **press snapshot first**.
+Again: order matters: **press snapshot first**.
 
 ### Motion capture
 
-Each looper has its own motion recorder.
+Each looper has its own motion recorder. Over the course of one loop, you can record any parameter changes you like (including modifiers, loop location, crops, additive mode toggle, sends, etc). The way it works is that parameters are saved at the corresponding phase of the loop where they were entered. That means that, if you set speed x2 half way through the loop, then the second half with play 2x faster, shortening the total length in absolute time. This is the intended behaviour, and can lead to some pretty wild results depending on what you try. There is one motion capture lane per looper.
 
-- plain motion key: start recording a new one-loop motion pass
-- press again while recording: stop early and start playback
-- after one full loop, recording stops automatically and playback begins
-- motion is phase-locked to the loop, not absolute time
+- *motion capture key*: start recording a new one-loop motion pass
+- *press again while recording*: stop early and start playback
+- *after one full loop*, recording stops automatically and playback begins
+- *press again during playback* to overwrite
+- *mod shift -> motion capture*: pause playback
+- *shift -> motion capture*: clear motion capture
 
-The current script also exposes motion status in the UI; recording, playback, and stored-but-stopped states are shown at different brightness levels.
+Motion capture status is visible on norns; recording, playback, and stored-but-stopped states are shown as dots at different brightness levels in the top right of the screen.
 
 ## Arc manual
 
@@ -173,15 +180,15 @@ Press the **arc button** to cycle pages.
 
 ### Page 1 — crop / window
 
-- **ring 1**: move crop start looper 1
+- **ring 1**: move playhead looper 1
 - **ring 2**: crop length looper 1
-- **ring 3**: move crop start looper 2
+- **ring 3**: move playhead looper 2
 - **ring 4**: crop length looper 2
 
 ### Page 2 — speed / sends
 
-- **ring 1**: free speed looper 1
-- **ring 2**: free speed looper 2
+- **ring 1**: free speed looper 1 (octaves are shown as bright lights, and fifths as dimmer lights; there are virtual notches at these locations and the lights slightly increase to help you find these musical intervals)
+- **ring 2**: free speed looper 2 (same octaves/fifths shenanigans as above)
 - **ring 3**: send 1 -> 2 amount
 - **ring 4**: send 2 -> 1 amount
 
@@ -198,7 +205,7 @@ The norns screen shows:
 
 - the two interlocking loop circles
 - playheads and crops
-- selected loopers with thicker rings
+- selected loopers with doubled rings
 - additive mode with a small `+` in the corresponding circle
 - a compact status stack in the top-right:
   - `∞` = linked playheads
@@ -210,11 +217,9 @@ The grid mirrors the same logic in a more performance-oriented way.
 ## Tips
 
 - Start simple: record one loop in each looper, then explore crop and speed.
-- Linked playheads become especially interesting once the two loop lengths differ.
-- Additive mode is great for gradual build-up and unstable tape-like layering.
-- Motion capture is strongest when you move only a few parameters with intent.
-- Snapshots are useful as performance anchors before pushing into tape, dropper, and jump.
+- Linked playheads is great for synced loops, and will timestretch loop 2 to match loop 1 if the two loop lengths differ.
+- Additive mode combined with overdub increases the intensity of applied modifiers on each loop pass. For example, if you are speeding up the loop, it get sped up again at every pass.
 
 ## Status
 
-This script has grown into a fairly complete instrument, but it is still an evolving personal project. Small layout and behavior details may continue to change.
+This is still an evolving project. Comments are welcome, and small layout and behavior details may continue to change.
