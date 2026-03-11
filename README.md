@@ -4,7 +4,7 @@
 
 It takes inspiration from the Chase Bliss Blooper and Instruō Lubadh, but it is not a straight clone. The idea is to treat two loopers as a small coupled ecosystem: you can record into either one, crop them from grid or arc, alter their speed and direction, add tape-style instability, inject random jumps, overdub additively, send one into the other, store snapshots, and capture motion over one loop.
 
-The script is designed to feel like an instrument rather than a list of parameters: fast access, a clear visual identity, a thought-out set of gestures that combine well and, importantly, no menu diving. I didn't even include editable parameters in norns's parameters menu. The aim is to combine the immediacy of a guitar pedal with the flexibility of norns/grid/arc. This is really made with grid in mind, although you should be able to have fun with just norns too. Arc offers easy access to a bunch of parameters that do improve the experience, but is not essential.
+The script is designed to feel like an instrument rather than a list of parameters: fast access, a clear visual identity, a thought-out set of gestures that combine well and, importantly, no menu diving. The only editable parameters in norns's parameters menu are the clock sync settings. The aim is to combine the immediacy of a guitar pedal with the flexibility of norns/grid/arc. This is really made with grid in mind, although you should be able to have fun with just norns too. Arc offers easy access to a bunch of parameters that do improve the experience, but is not essential.
 
 ## Requirements
 
@@ -29,6 +29,8 @@ The script is designed to feel like an instrument rather than a list of paramete
 - DJ-style filter + resonance
 - 2 performance snapshots
 - per-looper motion capture over one loop
+- clock sync modes (`FREE`, `BEAT`, `BAR`, `N_BARS`)
+- transport-aware pause / resume in clocked modes
 - custom grid, arc, and norns screen UI
 
 ## Files
@@ -46,6 +48,7 @@ The script is designed to feel like an instrument rather than a list of paramete
 4. Use the ring areas on grid or page 1 on arc to move the playhead and crop the loop.
 5. Shape the selected looper(s) from the grid columns.
 6. Add speed, sends, or filtering from arc pages 2 and 3.
+7. For quantized recording from grid, use the clock modes on the grid **REC** key and the clock sync params in norns.
 
 ## Core concept
 
@@ -139,11 +142,42 @@ Motion capture is represented by two dots (one per looper).
 - **16,2**: shift
 - **16,1**: clear
 
+### Record / clock actions
+
+Clocking is handled from the grid **REC** key.
+
+- **rec**: in `FREE` mode, regular record / stop / overdub; in clocked modes, quantized record / quantized stop / overdub
+- **shift + rec**: cycle clock mode (`FREE -> BEAT -> BAR -> N_BARS -> FREE`)
+- **mod shift + rec**: resync selected loopers to the start of their loops
+  - in `FREE` mode this happens immediately
+  - in `BEAT` mode this happens on the next beat
+  - in `BAR` and `N_BARS` this happens on the next bar
+- **shift + mod shift + rec**: restart paused playback on selected loopers
+
 ### Clear / shift actions
 
 - **clear**: clear selected looper(s) and clear their motion capture
 - **shift + clear**: full reset
 - **mod shift + clear**: clear modifiers
+- **shift + mod shift + clear**: stop playback on selected looper(s) without clearing the loop
+
+### Clock modes / transport
+
+Clock sync settings live in the norns params menu:
+
+- **clock mode**: `FREE`, `BEAT`, `BAR`, `N_BARS`
+- **bar beats**: size of one bar in beats
+- **n bars**: used by `N_BARS` mode
+- **ignore transport**: whether incoming transport start/stop affects bliss
+
+Behaviour:
+
+- **FREE**: no quantization
+- **BEAT**: recording starts and stops on the next beat
+- **BAR**: recording starts and stops on the next bar
+- **N_BARS**: recording starts on the next bar, records for the chosen number of bars, then stops automatically
+
+If **ignore transport** is **off**, transport stop pauses playback in place in clocked modes, and transport start resumes from that exact position and tick count.
 
 ### Snapshots
 
@@ -206,6 +240,7 @@ The norns screen shows:
 - playheads and crops
 - selected loopers with doubled rings
 - additive mode with a small `+` in the corresponding circle
+- the current clock mode in the bottom-right when in a clocked mode
 - a compact status stack in the top-right:
   - `∞` = linked playheads
   - `<->` = sends

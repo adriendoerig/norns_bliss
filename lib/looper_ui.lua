@@ -90,7 +90,9 @@ function ui.ring_idx_in_crop_span(L, idx)
   return (crop_start_frac < seg_end) and (crop_end_frac > seg_start)
 end
 
-function ui.grid_tapehead_viz(g, ring_owner_id, L, x_topright, y_topright, dimval, cropval, heldval, playval, offset_mult)
+function ui.grid_tapehead_viz(g, ring_owner_id, L, x_topright, y_topright, 
+                              dimval, cropval, heldval, playval, offset_mult)
+                            
   local full_len = math.max(L.full_loop_end - L.full_loop_start, 0.0001)
   local p = (L.play_pos - L.full_loop_start) / full_len
   p = util.clamp(p, 0.0, 1.0)
@@ -201,6 +203,37 @@ function ui.split_grid_strip(g, on_x, top_on_y, bottom_on_y, dimval, brightval)
   -- rows 5..8
   draw_half(5, 8, top_on_y)
 end
+
+local function ring_levels(L, pulse, clock_mode, clock_downbeat)
+    local dimval, cropval
+    if L.selected then
+      if L.is_recording or L.is_overdubbing then
+        if clock_mode ~= nil and clock_mode ~= 1 then
+          local max_boost = clock_downbeat and 3 or 1
+      
+          if L.is_recording then
+            dimval = 7 + math.floor(pulse * (max_boost + 2))
+            cropval = 11 + math.floor(pulse * 4)
+          else
+            dimval = 6 + math.floor(pulse * max_boost)
+            cropval = 10 + math.floor(pulse * 3)
+          end
+        else
+          local t = util.time()
+          local s = 0.5 + 0.5 * math.sin(2 * math.pi * 2.0 * t) -- 2 Hz pulse
+          dimval  = math.floor(5 + s * 5)   -- about 5..10
+          cropval = math.floor(9 + s * 4)   -- about 9..13
+        end
+      else
+        dimval  = 8
+        cropval = 12
+      end
+    else
+      dimval  = 3
+      cropval = 5
+    end
+    return dimval, cropval
+  end
 
 -- -------------------------------------------------------------------------
 -- SCREEN GEOMETRY / BUCKET DRAWING
@@ -327,16 +360,25 @@ end
 -- SCREEN HELPERS
 -- -------------------------------------------------------------------------
 
-local function screen_pulse_boost(L)
+local function screen_pulse_boost(L, clock_mode, clock_pulse_phase, clock_downbeat)
+  if clock_mode ~= nil and clock_mode ~= 1 then
+    local pulse = 1.0 - (clock_pulse_phase or 0)
+    local boost = clock_downbeat and 2 or 1
+    return pulse * boost
+  end
+
   if L.is_recording or L.is_overdubbing then
     return ((math.sin(util.time() * math.pi * 4) + 1) * 0.5) * 2
   end
+
   return 0
 end
 
-local function screen_base_level(L)
+local function screen_base_level(L, clock_mode, clock_pulse_phase, clock_downbeat)
   if L.is_recording or L.is_overdubbing then
-    return 8 + screen_pulse_boost(L) * 7
+    return 4 + screen_pulse_boost(L, clock_mode, clock_pulse_phase, clock_downbeat) * 4
+  elseif not L.is_recording and not L.is_overdubbing and clock_mode ~= nil and clock_mode ~= 1 then
+    return 2 + screen_pulse_boost(L, clock_mode, clock_pulse_phase, clock_downbeat) * 2
   elseif L.has_loop then
     return 8
   else
@@ -407,8 +449,8 @@ local function draw_crop_boundary_bars(L, pts, buckets)
   add_bar(pts[end_i])
 end
 
-local function draw_ring_segmented(L, pts, masks, buckets)
-  local base = screen_base_level(L)
+local function draw_ring_segmented(L, pts, masks, buckets, clock_mode, clock_pulse_phase, clock_downbeat)
+  local base = screen_base_level(L, clock_mode, clock_pulse_phase, clock_downbeat)
   local has_crop = screen_has_crop(L)
   local play_frac = screen_full_phase(L)
 
@@ -546,24 +588,40 @@ local function motion_level(L)
   end
 end
 
+local function motion_led_level(L)
+  if L.motion_recording then
+    -- fast blink ~4 Hz
+    local t = util.time()
+    return ((math.floor(t * 8) % 2) == 0) and 15 or 2
+  elseif L.motion_playback and L.motion_has_data then
+    -- breathe at 0.5 Hz
+    local t = util.time()
+    local s = 0.5 + 0.5 * math.sin(2 * math.pi * 0.5 * t)
+    return math.floor(3 + s * 12)
+  elseif L.motion_has_data then
+    return 6
+  else
+    return 1
+  end
+end
+
 -- -------------------------------------------------------------------------
 -- SCREEN DRAWING
 -- -------------------------------------------------------------------------
 
-local function draw_interlocking_loops(L1, L2)
+local function draw_interlocking_loops(L1, L2, clock_mode, clock_pulse_phase, clock_downbeat)
   local buckets = screen_bucket_init()
 
   -- extra inner ring to thicken selected loopers
   if L1.selected then
-    draw_ring_segmented(L1, SCREEN_PTS_1_INNER, SCREEN_MASKS_1, buckets)
+    draw_ring_segmented(L1, SCREEN_PTS_1_INNER, SCREEN_MASKS_1, buckets, clock_mode, clock_pulse_phase, clock_downbeat)
   end
   if L2.selected then
-    draw_ring_segmented(L2, SCREEN_PTS_2_INNER, SCREEN_MASKS_2, buckets)
+    draw_ring_segmented(L2, SCREEN_PTS_2_INNER, SCREEN_MASKS_2, buckets, clock_mode, clock_pulse_phase, clock_downbeat)
   end
-
-  -- main rings
-  draw_ring_segmented(L1, SCREEN_PTS_1, SCREEN_MASKS_1, buckets)
-  draw_ring_segmented(L2, SCREEN_PTS_2, SCREEN_MASKS_2, buckets)
+  
+  draw_ring_segmented(L1, SCREEN_PTS_1, SCREEN_MASKS_1, buckets, clock_mode, clock_pulse_phase, clock_downbeat)
+  draw_ring_segmented(L2, SCREEN_PTS_2, SCREEN_MASKS_2, buckets, clock_mode, clock_pulse_phase, clock_downbeat)
 
   screen_bucket_flush(buckets)
 
@@ -716,7 +774,7 @@ local function draw_status_stack(loopers, link_playheads,
   local L2 = loopers[2]
 
   local x = 124
-  local y0 = 8
+  local y0 = 6
   local dy = 8
 
   screen.font_size(8)
@@ -769,16 +827,21 @@ local function draw_status_stack(loopers, link_playheads,
   screen.text("•")
 end
 
-function ui.redraw(loopers, g, a, link_playheads,
-                   send_1_to_2, send_2_to_1,
-                   send_1_to_2_enabled, send_2_to_1_enabled, arc_page,
-                   k1_held, k2_held, k3_held,
-                   k1_down_time, k2_down_time, k3_down_time)
+function ui.redraw(
+  loopers, g, a,
+  link_playheads,
+  send_1_to_2, send_2_to_1,
+  send_1_to_2_enabled, send_2_to_1_enabled,
+  arc_page,
+  k1_held, k2_held, k3_held,
+  k1_down_time, k2_down_time, k3_down_time,
+  mode_label, clock_phase, clock_downbeat, clock_mode
+)
   local L1 = loopers[1]
   local L2 = loopers[2]
 
   screen.clear()
-  draw_interlocking_loops(L1, L2)
+  draw_interlocking_loops(L1, L2, clock_mode, clock_phase, clock_downbeat)
   draw_norns_help_labels(
     loopers, link_playheads,
     k1_held, k2_held, k3_held,
@@ -789,6 +852,15 @@ function ui.redraw(loopers, g, a, link_playheads,
     send_1_to_2, send_2_to_1,
     send_1_to_2_enabled, send_2_to_1_enabled
   )
+
+  if mode_label ~= nil then
+    local pulse = 1.0 - clock_phase
+    local level = 4 + math.floor(pulse * (clock_downbeat and 11 or 7))
+    screen.level(level)
+    screen.move(110, 6)
+    screen.text_right(mode_label)
+  end
+
   screen.update()
 end
 
@@ -801,33 +873,41 @@ function ui.grid_redraw(g, loopers, link_playheads,
                         send_1_to_2_enabled, send_2_to_1_enabled,
                         shift_held, mod_shift_held,
                         snapshot_1_filled, snapshot_2_filled,
-                        snapshot_flash_kind)
+                        snapshot_flash_kind,
+                        clock_mode, clock_pulse_phase, clock_downbeat)
   if not g or not g.device then return end
 
   local L = strip_source_looper(loopers)
-
   local t = util.time()
+  local pulse = 1.0 - clock_pulse_phase
 
   g:all(0)
 
+  -- MIX KEYS
   local drywet_selected_y = ui.grid_get_nearest_yval(L.drywet, defs.DRYWET_VALUES)
   ui.grid_strip(g, defs.DRYWET_COL, drywet_selected_y, true, -1, 15)
 
+  -- OVERDUB KEYS
   local overdub_selected_y = ui.grid_get_nearest_yval(L.overdub, defs.OVERDUB_VALUES)
   ui.grid_strip(g, defs.OVERDUB_COL, overdub_selected_y, false, -1, 15)
 
-  local tape_selected_y = ui.grid_get_nearest_yval(L.tape_age, defs.TAPE_WARBLE_VALUES)
-  ui.grid_strip(g, defs.TAPE_WARBLE_COL, tape_selected_y, false, -1, 15)
-
+  -- FILTER KEYS
   local filter_selected_y = ui.grid_get_nearest_yval(L.dj_filter_freq, defs.FILTER_VALUES)
   ui.grid_strip(g, defs.FILTER_COL, filter_selected_y, true, -1, 15)
 
+  -- STEPPED SPEED KEYS
   local stp_speed_selected_y = ui.grid_get_nearest_yval(math.abs(L.rate), defs.STP_SPEED_VALUES)
   ui.grid_strip(g, defs.STP_SPEED_COL, stp_speed_selected_y, true, -1, 15)
+  
+  -- TAPE WARBLE KEYS
+  local tape_selected_y = ui.grid_get_nearest_yval(L.tape_age, defs.TAPE_WARBLE_VALUES)
+  ui.grid_strip(g, defs.TAPE_WARBLE_COL, tape_selected_y, false, -1, 15)
 
+  -- DROPPER KEYS
   local dropper_selected_y = ui.grid_get_nearest_yval(L.dropper_amt, defs.DROPPER_VALUES)
   ui.grid_strip(g, defs.DROPPER_COL, dropper_selected_y, false, -1, 15)
 
+  -- JUMP KEYS
   local jump_target_y = nil
   local jump_target_is_shift = false
   for y = 5, 8 do
@@ -857,13 +937,10 @@ function ui.grid_redraw(g, loopers, link_playheads,
       end
     end
   end
-
   local top_dim = jump_target_is_shift and 10 or 5
   local top_bright = jump_target_is_shift and 15 or 12
-
   local bottom_dim = jump_trigger_is_shift and 10 or 5
   local bottom_bright = jump_trigger_is_shift and 15 or 12
-
   ui.split_grid_strip(
     g,
     defs.JUMP_COL,
@@ -872,7 +949,6 @@ function ui.grid_redraw(g, loopers, link_playheads,
     -1,
     15
   )
-
   -- redraw top half with custom brightness for shift-vs-normal target values
   if jump_target_y ~= nil then
     for y = 5, 8 do
@@ -883,7 +959,6 @@ function ui.grid_redraw(g, loopers, link_playheads,
       g:led(defs.JUMP_COL, y, level)
     end
   end
-
   -- redraw bottom half with custom brightness for shift-vs-normal trigger values
   if jump_trigger_y ~= nil then
     for y = 1, 4 do
@@ -896,82 +971,69 @@ function ui.grid_redraw(g, loopers, link_playheads,
   else
     g:led(defs.JUMP_COL, 4, 2)
   end
-
-  local function ring_levels(L)
-    local dimval, cropval
-    if L.selected then
-      if L.is_recording or L.is_overdubbing then
-        local s = 0.5 + 0.5 * math.sin(2 * math.pi * 2.0 * t) -- 2 Hz pulse
-        dimval  = math.floor(5 + s * 5)   -- about 5..10
-        cropval = math.floor(9 + s * 4)   -- about 9..13
-      else
-        dimval  = 8
-        cropval = 12
-      end
-    else
-      dimval  = 3
-      cropval = 5
-    end
-    return dimval, cropval
-  end
-
-  local l1_dim, l1_crop = ring_levels(loopers[1])
-  local l2_dim, l2_crop = ring_levels(loopers[2])
-
+  
+  -- RING KEYS
+  local l1_dim, l1_crop = ring_levels(loopers[1], pulse, clock_mode, clock_downbeat)
+  local l2_dim, l2_crop = ring_levels(loopers[2], pulse, clock_mode, clock_downbeat)
   ui.grid_tapehead_viz(
     g, 1, loopers[1],
     defs.LEFT_RING_TOPRIGHT[1], defs.LEFT_RING_TOPRIGHT[2],
     l1_dim, l1_crop, 12, 15, 1
   )
-
   ui.grid_tapehead_viz(
     g, 2, loopers[2],
     defs.RIGHT_RING_TOPRIGHT[1], defs.RIGHT_RING_TOPRIGHT[2],
     l2_dim, l2_crop, 12, 15, -1
   )
 
+  -- SINK PLAYHEADS KEYS
   local s = 0.5 + 0.5 * math.sin(2 * math.pi * 1.0 * t)
   ui.grid_led_any(g, defs.LINK_PLAYHEADS_KEY, link_playheads and math.floor(1 + s * 3) or 0)
 
-  -- ui.grid_led_any(g, defs.LINK_PLAYHEADS_KEY, link_playheads and 2 or 0)
-
+  -- SEND KEYS
   ui.grid_led_any(g, defs.SEND_1_TO_2_KEY, send_1_to_2_enabled and math.floor(1 + s * 3) or 0)
   ui.grid_led_any(g, defs.SEND_2_TO_1_KEY, send_2_to_1_enabled and math.floor(1 + s * 3) or 0)
 
-  local function motion_led_level(L)
-    if L.motion_recording then
-      -- fast blink ~4 Hz
-      return ((math.floor(t * 8) % 2) == 0) and 15 or 2
-    elseif L.motion_playback and L.motion_has_data then
-      -- breathe at 0.5 Hz
-      local s = 0.5 + 0.5 * math.sin(2 * math.pi * 0.5 * t)
-      return math.floor(3 + s * 12)
-    elseif L.motion_has_data then
-      return 6
-    else
-      return 1
-    end
-  end
-
+  -- MOTION RECORDING KEYS
   g:led(defs.MOTION1_KEY[1], defs.MOTION1_KEY[2], motion_led_level(loopers[1]))
   g:led(defs.MOTION2_KEY[1], defs.MOTION2_KEY[2], motion_led_level(loopers[2]))
-
-  ui.grid_led_any(g, defs.ADDITIVE_KEY, L.additive_mode and 15 or 1)
+  
+  -- REC KEY
+  local rec_level = 4
+  if clock_mode ~= nil and clock_mode ~= 1 then
+  
+    if clock_downbeat then
+      rec_level = 5 + math.floor(pulse * 10)
+    else
+      rec_level = 2 + math.floor(pulse * 5)
+    end
+  
+    if L.is_recording then
+      rec_level = math.min(15, rec_level + 2)
+    elseif L.is_overdubbing then
+      rec_level = 15
+    end
+  else
+    rec_level = (L.is_recording or L.is_overdubbing) and 15 or 4
+  end
+  g:led(defs.REC_KEY[1], defs.REC_KEY[2], rec_level)
+  
+  -- REVERSE_KEY
   ui.grid_led_any(g, defs.REVERSE_KEY, L.is_reversed and 15 or 2)
 
+  -- SLEW KEY
   local slew_led = 2
   if L.rate_slew_mode == 1 then
     slew_led = 6
   elseif L.rate_slew_mode == 2 then
     slew_led = 12
   end
-
   g:led(defs.RATE_SLEW_KEY[1], defs.RATE_SLEW_KEY[2], slew_led)
-
-  g:led(defs.REC_KEY[1], defs.REC_KEY[2], (L.is_recording or L.is_overdubbing) and 15 or 4)
-  g:led(defs.MOD_SHIFT_KEY[1], defs.MOD_SHIFT_KEY[2], mod_shift_held and 8 or 2)
-  g:led(defs.SHIFT_KEY[1], defs.SHIFT_KEY[2], shift_held and 8 or 3)
-
+  
+  -- ADDITIVE KEY
+  ui.grid_led_any(g, defs.ADDITIVE_KEY, L.additive_mode and 15 or 1)
+  
+  -- SNAPSHOT KEY
   local snap_level = 1
   if snapshot_1_filled and snapshot_2_filled then
     snap_level = 15
@@ -980,7 +1042,6 @@ function ui.grid_redraw(g, loopers, link_playheads,
   elseif snapshot_1_filled then
     snap_level = 8
   end
-
   if snapshot_flash_kind == "store" then
     snap_level = 10
   elseif snapshot_flash_kind == "recall" then
@@ -992,9 +1053,15 @@ function ui.grid_redraw(g, loopers, link_playheads,
   elseif snapshot_flash_kind == "delete" then
     snap_level = 0
   end
-
   g:led(defs.SNAPSHOT_KEY[1], defs.SNAPSHOT_KEY[2], snap_level)
 
+  -- MODSHIFT KEY  
+  g:led(defs.MOD_SHIFT_KEY[1], defs.MOD_SHIFT_KEY[2], mod_shift_held and 8 or 2)
+  
+  -- SHIFT KEY
+  g:led(defs.SHIFT_KEY[1], defs.SHIFT_KEY[2], shift_held and 8 or 3)
+
+  -- CLEAR KEY
   g:led(defs.CLEAR_KEY[1], defs.CLEAR_KEY[2], 4)
 
   g:refresh()

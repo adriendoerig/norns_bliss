@@ -70,6 +70,26 @@ local refresh_routing
 local restore_performance_state
 
 -- -------------------------------------------------------------------------
+-- CLOCKING
+-- -------------------------------------------------------------------------
+
+local CLOCK_MODE_FREE = 1
+local CLOCK_MODE_BEAT = 2
+local CLOCK_MODE_BAR = 3
+local CLOCK_MODE_N_BARS = 4
+
+local clock_mode = CLOCK_MODE_FREE
+local clock_bar_beats = 4
+local clock_n_bars = 4
+local clock_ignore_transport = false
+local clock_transport_running = true
+local clock_ui_beat_phase = 0.0
+local clock_ui_is_downbeat = false
+local last_clock_beat = nil
+local clock_tick_task = nil
+local pending_selected_resync = false
+
+-- -------------------------------------------------------------------------
 -- HELPERS
 -- -------------------------------------------------------------------------
 
@@ -86,10 +106,211 @@ local function redraw_all()
     send_1_to_2_enabled, send_2_to_1_enabled,
     shift_held, mod_shift_held,
     snapshot_1 ~= nil, snapshot_2 ~= nil,
-    snapshot_flash_kind
+    snapshot_flash_kind,
+    clock_mode, clock_ui_beat_phase, clock_ui_is_downbeat
   )
 
   looper_ui.arc_redraw(a, loopers, arc_page, send_1_to_2, send_2_to_1)
+end
+
+-- -------------------------------------------------------------------------
+-- CLOCK HELPERS
+-- -------------------------------------------------------------------------
+
+local function is_clocked_mode()
+  return clock_mode ~= CLOCK_MODE_FREE
+end
+
+local function current_quantum_beats()
+  if clock_mode == CLOCK_MODE_BEAT then
+    return 1
+  elseif clock_mode == CLOCK_MODE_BAR or clock_mode == CLOCK_MODE_N_BARS then
+    return clock_bar_beats
+  end
+  return nil
+end
+
+local function mode_label()
+  if clock_mode == CLOCK_MODE_BEAT then
+    return "BEAT"
+  elseif clock_mode == CLOCK_MODE_BAR then
+    return "BAR"
+  elseif clock_mode == CLOCK_MODE_N_BARS then
+    return tostring(clock_n_bars) .. " BARS"
+  end
+  return nil
+end
+
+local function handle_clock_tick()
+  for _, L in ipairs(loopers) do
+    if clock_transport_running and not L.clock_paused then
+      if L.is_recording then
+        L.clock_record_ticks = L.clock_record_ticks + 1
+
+        if clock_mode == CLOCK_MODE_N_BARS then
+          local target = clock_n_bars * clock_bar_beats
+          if L.clock_record_ticks >= target then
+            stop_record_now(L)
+          end
+        end
+      elseif L.has_loop and L.clock_loop_ticks and not L.is_overdubbing then
+        L.clock_play_ticks = L.clock_play_ticks + 1
+        if L.clock_play_ticks >= L.clock_loop_ticks then
+          looper_engine.reset_to_cycle_start(L)
+          L.clock_play_ticks = 0
+        end
+      elseif L.has_loop and L.clock_loop_ticks and L.is_overdubbing then
+        L.clock_play_ticks = L.clock_play_ticks + 1
+        if L.clock_play_ticks >= L.clock_loop_ticks then
+          looper_engine.reset_to_cycle_start(L)
+          L.clock_play_ticks = 0
+        end
+      end
+    end
+  end
+end
+
+local function start_clock_tick_task()
+  if clock_tick_task then
+    clock.cancel(clock_tick_task)
+  end
+
+  clock_tick_task = clock.run(function()
+    while true do
+      clock.sync(1)
+      handle_clock_tick()
+    end
+  end)
+end
+
+local function start_record_now(L)
+  looper_engine.start_recording(L)
+  L.clock_record_ticks = 0
+  L.clock_play_ticks = 0
+end
+
+local function stop_record_now(L)
+  if clock_mode == CLOCK_MODE_N_BARS then
+    L.clock_loop_ticks = clock_n_bars * clock_bar_beats
+  else
+    L.clock_loop_ticks = math.max(L.clock_record_ticks, 1)
+  end
+
+  looper_engine.stop_recording_and_play_clocked(L, L.clock_loop_ticks)
+  L.clock_play_ticks = 0
+end
+
+local function toggle_clocked_record(L)
+  local quantum = current_quantum_beats()
+  if quantum == nil then
+    looper_engine.toggle(L)
+    return
+  end
+
+  if not L.is_recording and not L.has_loop then
+    if L.clock_record_task then clock.cancel(L.clock_record_task) end
+    L.clock_pending_start = true
+    L.clock_pending_stop = false
+    L.clock_pending_stop_at_bar = false
+
+    L.clock_record_task = clock.run(function()
+      clock.sync(quantum)
+      L.clock_pending_start = false
+      start_record_now(L)
+      redraw_all()
+    end)
+    redraw_all()
+    return
+  end
+
+  if L.is_recording then
+    if clock_mode == CLOCK_MODE_N_BARS then
+      L.clock_pending_stop_at_bar = true
+      if L.clock_record_task then clock.cancel(L.clock_record_task) end
+      L.clock_record_task = clock.run(function()
+        clock.sync(clock_bar_beats)
+        L.clock_pending_stop_at_bar = false
+        if L.is_recording then
+          stop_record_now(L)
+        end
+        redraw_all()
+      end)
+    else
+      L.clock_pending_stop = true
+      if L.clock_record_task then clock.cancel(L.clock_record_task) end
+      L.clock_record_task = clock.run(function()
+        clock.sync(quantum)
+        L.clock_pending_stop = false
+        if L.is_recording then
+          stop_record_now(L)
+        end
+        redraw_all()
+      end)
+    end
+    redraw_all()
+    return
+  end
+
+  if L.has_loop and not L.is_overdubbing then
+    looper_engine.start_overdub(L)
+  elseif L.is_overdubbing then
+    looper_engine.stop_overdub(L)
+  end
+end
+
+local function resync_quantum()
+  if clock_mode == CLOCK_MODE_BAR or clock_mode == CLOCK_MODE_N_BARS then
+    return clock_bar_beats
+  end
+  return 1
+end
+
+local function execute_selected_resync()
+  pending_selected_resync = false
+  for _, L in ipairs(loopers) do
+    if L.selected and L.has_loop and not L.is_recording then
+      looper_engine.reset_to_cycle_start(L)
+      if L.clock_play_ticks ~= nil then
+        L.clock_play_ticks = 0
+      end
+    end
+  end
+  redraw_all()
+end
+
+local function queue_selected_resync()
+  if pending_selected_resync then
+    return
+  end
+  pending_selected_resync = true
+
+  clock.run(function()
+    clock.sync(resync_quantum())
+    if pending_selected_resync then
+      execute_selected_resync()
+    end
+  end)
+
+  redraw_all()
+end
+
+local function update_clock_param_visibility()
+  params:hide("bliss_bar_beats")
+  params:hide("bliss_n_bars")
+  params:hide("bliss_ignore_transport")
+
+  if clock_mode == CLOCK_MODE_BEAT then
+    params:show("bliss_ignore_transport")
+  elseif clock_mode == CLOCK_MODE_BAR then
+    params:show("bliss_bar_beats")
+    params:show("bliss_ignore_transport")
+  elseif clock_mode == CLOCK_MODE_N_BARS then
+    params:show("bliss_bar_beats")
+    params:show("bliss_n_bars")
+    params:show("bliss_ignore_transport")
+  end
+
+  _menu.rebuild_params()
 end
 
 -- -------------------------------------------------------------------------
@@ -1053,6 +1274,7 @@ local function grid_key(x, y, z)
   end
 
   if x == defs.REC_KEY[1] and y == defs.REC_KEY[2] then
+    -- snapshot toggle
     if snapshot_key_held then
       if z == 1 then
         snapshot_mode_overwrite = true
@@ -1063,8 +1285,9 @@ local function grid_key(x, y, z)
       redraw_all()
       return
     end
-
+  
     if z == 1 then
+      -- restart paused playback
       if shift_held and mod_shift_held then
         looper_engine.for_each_selected(loopers, function(LL)
           if LL.has_loop then
@@ -1077,10 +1300,34 @@ local function grid_key(x, y, z)
         refresh_routing()
         redraw_all()
         return
+  
+      -- resync loops
+      elseif mod_shift_held then
+        if clock_mode == CLOCK_MODE_FREE then
+          execute_selected_resync()
+        else
+          queue_selected_resync()
+        end
+        redraw_all()
+        return
+  
+      -- clocking mode toggle
+      elseif shift_held then
+        local next_mode = clock_mode + 1
+        if next_mode > CLOCK_MODE_N_BARS then
+          next_mode = CLOCK_MODE_FREE
+        end
+        params:set("bliss_clock_mode", next_mode)
+        redraw_all()
+        return
       end
-
+  
       looper_engine.for_each_selected(loopers, function(LL)
-        looper_engine.toggle(LL)
+        if is_clocked_mode() then
+          toggle_clocked_record(LL)
+        else
+          looper_engine.toggle(LL)
+        end
       end)
       refresh_routing()
       redraw_all()
@@ -1289,6 +1536,7 @@ function init()
   end)
   softcut.poll_start_phase()
 
+-- metronome
   viz_metro = metro.init()
   viz_metro.time = 1 / 20
   viz_metro.event = function()
@@ -1299,10 +1547,28 @@ function init()
       looper_engine.apply_jump(L)
     end
     sync_linked_playheads()
+    
+    if is_clocked_mode() then
+  local beat = clock.get_beats()
+  clock_ui_beat_phase = beat - math.floor(beat)
+
+  if clock_mode == CLOCK_MODE_BAR or clock_mode == CLOCK_MODE_N_BARS then
+      local beat_index = math.floor(beat)
+      local beat_in_bar = (beat_index % clock_bar_beats) + 1
+      clock_ui_is_downbeat = (beat_in_bar == 1)
+    else
+      clock_ui_is_downbeat = false
+    end
+  else
+    clock_ui_beat_phase = 0
+    clock_ui_is_downbeat = false
+  end
+    
     redraw_all()
   end
   viz_metro:start()
 
+  -- grid/arc
   g = grid.connect()
   if g and g.device then
     g.key = grid_key
@@ -1313,6 +1579,96 @@ function init()
     a.delta = arc_delta
     a.key = arc_key
   end
+  
+  -- transport/clock
+  start_clock_tick_task()
+  
+  clock.transport.start = function()
+    if clock_ignore_transport then return end
+  
+    clock_transport_running = true
+  
+    for _, L in ipairs(loopers) do
+      if L.clock_paused then
+        L.clock_paused = false
+  
+        if L.has_loop then
+          looper_engine.resume_playback(L)
+        end
+      end
+    end
+  
+    redraw_all()
+  end
+  
+  clock.transport.stop = function()
+    if clock_ignore_transport then return end
+  
+    clock_transport_running = false
+  
+    for _, L in ipairs(loopers) do
+      if L.is_recording then
+        stop_record_now(L)
+      end
+  
+      if L.has_loop then
+        looper_engine.pause_playback(L)
+      end
+  
+      L.clock_paused = true
+    end
+  
+    redraw_all()
+  end
+  
+  -- editable params
+  params:add_separator("bliss_clock_sync_section", "Clock sync")
+  params:add_option("bliss_clock_mode", "clock mode", {"FREE", "BEAT", "BAR", "N_BARS"}, 1)
+  params:set_action("bliss_clock_mode", function(v)
+    local new_mode = v
+  
+    if new_mode ~= CLOCK_MODE_FREE and clock_mode == CLOCK_MODE_FREE then
+      local all_empty = true
+      for _, L in ipairs(loopers) do
+        if L.has_loop or L.is_recording or L.is_overdubbing then
+          all_empty = false
+        end
+      end
+      if not all_empty then
+        params:set("bliss_clock_mode", clock_mode)
+        return
+      end
+    end
+  
+    if new_mode == CLOCK_MODE_FREE and clock_mode ~= CLOCK_MODE_FREE then
+      for _, L in ipairs(loopers) do
+        looper_engine.clear_clock_state(L)
+      end
+    end
+  
+    clock_mode = new_mode
+    update_clock_param_visibility()
+    redraw_all()
+  end)
+  
+  params:add_number("bliss_bar_beats", "bar beats", 1, 16, 4)
+  params:set_action("bliss_bar_beats", function(v)
+    clock_bar_beats = v
+    redraw_all()
+  end)
+  
+  params:add_number("bliss_n_bars", "n bars", 1, 16, 4)
+  params:set_action("bliss_n_bars", function(v)
+    clock_n_bars = v
+    redraw_all()
+  end)
+  
+  params:add_option("bliss_ignore_transport", "ignore transport", {"off", "on"}, 1)
+  params:set_action("bliss_ignore_transport", function(v)
+    clock_ignore_transport = (v == 2)
+  end)
+  
+  update_clock_param_visibility()
 
   redraw_all()
 end
@@ -1325,7 +1681,8 @@ function redraw()
     send_1_to_2_enabled, send_2_to_1_enabled,
     arc_page,
     k1_held, k2_held, k3_held,
-    k1_down_time, k2_down_time, k3_down_time
+    k1_down_time, k2_down_time, k3_down_time,
+    mode_label(), clock_ui_beat_phase, clock_ui_is_downbeat, clock_mode
   )
 end
 

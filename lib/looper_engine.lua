@@ -65,6 +65,17 @@ function engine.reset_looper_state(L)
   L.motion_data = {}
   L.motion_last_step = nil
   L.motion_record_start_step = nil
+  
+  L.clock_loop_ticks = nil
+  L.clock_record_ticks = 0
+  L.clock_play_ticks = 0
+
+  L.clock_record_task = nil
+  L.clock_pending_start = false
+  L.clock_pending_stop = false
+  L.clock_pending_stop_at_bar = false
+
+  L.clock_paused = false
 end
 
 function engine.new_looper(id, play_voice, write_voice, buffer_id)
@@ -132,6 +143,8 @@ function engine.reset_looper(L)
   engine.set_dj_filter_rq(L, 1.0)
   engine.set_dj_filter_freq(L, 0.0)
   engine.update_output_mix(L)
+  
+  engine.clear_clock_state(L)
 end
 
 -- -------------------------------------------------------------------------
@@ -528,6 +541,35 @@ function engine.stop_recording_and_play(L)
   engine.apply_write_mode(L)
 end
 
+function engine.stop_recording_and_play_clocked(L, tick_count)
+  L.is_recording = false
+  L.has_loop = true
+  L.is_overdubbing = false
+
+  local len = tick_count * clock.get_beat_sec()
+  len = util.clamp(len, defs.MIN_LEN, defs.MAX_LEN)
+
+  L.full_loop_start = 0.0
+  L.full_loop_end = len
+  L.crop_start = L.full_loop_start
+  L.crop_len = L.full_loop_end - L.full_loop_start
+  L.crop_wraps = false
+
+  softcut.rec(L.write_voice, 0)
+  softcut.rec_level(L.write_voice, 0.0)
+  softcut.pre_level(L.write_voice, 1.0)
+
+  engine.set_loop_bounds(L, 0.0, len)
+  engine.set_loop_position(L, 0.0)
+
+  softcut.play(L.play_voice, 1)
+  engine.apply_rate(L)
+  engine.update_output_mix(L)
+
+  softcut.play(L.write_voice, 1)
+  engine.apply_write_mode(L)
+end
+
 function engine.start_overdub(L)
   if not L.has_loop then return end
   L.is_overdubbing = true
@@ -705,6 +747,26 @@ function engine.clear_loop(L)
   engine.apply_rate(L)
   engine.apply_rate_slew(L)
   engine.update_output_mix(L)
+  
+  engine.clear_clock_state(L)
+end
+
+-- -------------------------------------------------------------------------
+-- CLOCKED TRANSPORT PAUSE
+-- -------------------------------------------------------------------------
+
+function engine.pause_playback(L)
+  softcut.play(L.play_voice, 0)
+  softcut.play(L.write_voice, 0)
+end
+
+function engine.resume_playback(L)
+  if L.has_loop then
+    softcut.play(L.play_voice, 1)
+    softcut.play(L.write_voice, 1)
+    engine.apply_rate(L)
+    engine.apply_write_mode(L)
+  end
 end
 
 -- -------------------------------------------------------------------------
@@ -1241,6 +1303,40 @@ function engine.phase_cb(loopers, i, pos)
       return
     end
   end
+end
+
+-- -------------------------------------------------------------------------
+-- CLOCK
+-- -------------------------------------------------------------------------
+
+function engine.clear_clock_state(L)
+  if L.clock_record_task then
+    clock.cancel(L.clock_record_task)
+    L.clock_record_task = nil
+  end
+
+  L.clock_loop_ticks = nil
+  L.clock_record_ticks = 0
+  L.clock_play_ticks = 0
+
+  L.clock_pending_start = false
+  L.clock_pending_stop = false
+  L.clock_pending_stop_at_bar = false
+  L.clock_paused = false
+end
+
+function engine.current_reset_target(L)
+  if L.crop_start ~= nil and L.crop_len ~= nil and L.crop_len < (L.full_loop_end - L.full_loop_start - 0.0001) then
+    return L.crop_start
+  end
+  return L.full_loop_start
+end
+
+function engine.reset_to_cycle_start(L)
+  local pos = engine.current_reset_target(L)
+  softcut.position(L.play_voice, pos)
+  softcut.position(L.write_voice, pos)
+  L.play_pos = pos
 end
 
 -- -------------------------------------------------------------------------
