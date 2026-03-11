@@ -2,6 +2,10 @@ local defs = include("lib/looper_defs")
 
 local ui = {}
 
+-- -------------------------------------------------------------------------
+-- GRID HELPERS
+-- -------------------------------------------------------------------------
+
 local function ring_overlap_owner(x, y)
   local key = x .. "," .. y
   return defs.RING_OVERLAP_OWNERS[key]
@@ -41,6 +45,28 @@ function ui.grid_match_any(x, y, coords)
     end
   end
   return false
+end
+
+function ui.grid_led_any(g, coords, level)
+  for i = 1, #coords do
+    g:led(coords[i][1], coords[i][2], level)
+  end
+end
+
+function ui.grid_ring_hit(x, y, ring_owner_id, x_topright, y_topright)
+  local owner = ring_overlap_owner(x, y)
+  if owner ~= nil and owner ~= ring_owner_id then
+    return nil
+  end
+
+  for i = 1, #defs.TAPEHEAD_RING_PTS do
+    local px = x_topright + defs.TAPEHEAD_RING_PTS[i][1] - 1
+    local py = y_topright + defs.TAPEHEAD_RING_PTS[i][2] - 1
+    if x == px and y == py then
+      return i
+    end
+  end
+  return nil
 end
 
 function ui.ring_idx_in_crop_span(L, idx)
@@ -97,22 +123,6 @@ function ui.grid_tapehead_viz(g, ring_owner_id, L, x_topright, y_topright, dimva
     g:led(px, py, level)
     ::continue::
   end
-end
-
-function ui.grid_ring_hit(x, y, ring_owner_id, x_topright, y_topright)
-  local owner = ring_overlap_owner(x, y)
-  if owner ~= nil and owner ~= ring_owner_id then
-    return nil
-  end
-
-  for i = 1, #defs.TAPEHEAD_RING_PTS do
-    local px = x_topright + defs.TAPEHEAD_RING_PTS[i][1] - 1
-    local py = y_topright + defs.TAPEHEAD_RING_PTS[i][2] - 1
-    if x == px and y == py then
-      return i
-    end
-  end
-  return nil
 end
 
 function ui.grid_strip(g, on_x, on_y, bipolar, dimval, brightval)
@@ -185,22 +195,16 @@ function ui.split_grid_strip(g, on_x, top_on_y, bottom_on_y, dimval, brightval)
     end
   end
 
-  -- bottom half: rows 1..4
+  -- rows 1..4
   draw_half(1, 4, bottom_on_y)
 
-  -- top half: rows 5..8
+  -- rows 5..8
   draw_half(5, 8, top_on_y)
 end
 
-function ui.grid_led_any(g, coords, level)
-  for i = 1, #coords do
-    g:led(coords[i][1], coords[i][2], level)
-  end
-end
-
--- ------------------------------------------------------------------
--- screen drawing
--- ------------------------------------------------------------------
+-- -------------------------------------------------------------------------
+-- SCREEN GEOMETRY / BUCKET DRAWING
+-- -------------------------------------------------------------------------
 
 local SCREEN_LEFT_CX  = 48
 local SCREEN_LEFT_CY  = 28
@@ -318,6 +322,10 @@ local function screen_bucket_flush(buckets)
     end
   end
 end
+
+-- -------------------------------------------------------------------------
+-- SCREEN HELPERS
+-- -------------------------------------------------------------------------
 
 local function screen_pulse_boost(L)
   if L.is_recording or L.is_overdubbing then
@@ -440,55 +448,6 @@ local function draw_ring_segmented(L, pts, masks, buckets)
   draw_crop_boundary_bars(L, pts, buckets)
 end
 
-local function draw_link_overlap_glow(buckets)
-  local t = util.time()
-  local breath = 0.78 + 0.22 * math.sin(2 * math.pi * 0.5 * t)
-
-  local cx1, cy1 = 40, 32
-  local cx2, cy2 = 88, 32
-  local r = 26
-
-  local x0 = math.floor(math.min(cx1 - r, cx2 - r))
-  local x1 = math.floor(math.max(cx1 + r, cx2 + r))
-  local y0 = math.floor(math.min(cy1 - r, cy2 - r))
-  local y1 = math.floor(math.max(cy1 + r, cy2 + r))
-
-  for x = x0, x1 do
-    for y = y0, y1 do
-      local d1 = math.sqrt((x - cx1) * (x - cx1) + (y - cy1) * (y - cy1))
-      local d2 = math.sqrt((x - cx2) * (x - cx2) + (y - cy2) * (y - cy2))
-
-      if d1 <= r and d2 <= r then
-        -- depth inside each circle
-        local in1 = r - d1
-        local in2 = r - d2
-
-        -- overlap strength is limited by how deep we are in both discs
-        local overlap = math.min(in1, in2) / r
-        overlap = util.clamp(overlap, 0, 1)
-
-        -- slightly stronger in the vertical middle of the lens
-        local y_mid_weight = 1.0 - math.min(math.abs(y - 32) / 18, 1.0)
-        local level = (2 + 10 * overlap * (0.65 + 0.35 * y_mid_weight)) * breath
-
-        screen_bucket_px(buckets, x, y, level)
-      end
-    end
-  end
-end
-
-local function draw_disc_fill(buckets, cx, cy, r, level)
-  for x = math.floor(cx - r), math.floor(cx + r) do
-    for y = math.floor(cy - r), math.floor(cy + r) do
-      local dx = x - cx
-      local dy = y - cy
-      if dx * dx + dy * dy <= r * r then
-        screen_bucket_px(buckets, x, y, level)
-      end
-    end
-  end
-end
-
 local function draw_additive_plus(cx, cy, level)
   screen.level(level)
   screen.move(cx - 3, cy)
@@ -497,32 +456,6 @@ local function draw_additive_plus(cx, cy, level)
   screen.move(cx, cy - 3)
   screen.line(cx, cy + 2)
   screen.stroke()
-end
-
-local function draw_interlocking_loops(L1, L2)
-  local buckets = screen_bucket_init()
-
-  -- extra inner ring to thicken selected loopers
-  if L1.selected then
-    draw_ring_segmented(L1, SCREEN_PTS_1_INNER, SCREEN_MASKS_1, buckets)
-  end
-  if L2.selected then
-    draw_ring_segmented(L2, SCREEN_PTS_2_INNER, SCREEN_MASKS_2, buckets)
-  end
-
-  -- main rings
-  draw_ring_segmented(L1, SCREEN_PTS_1, SCREEN_MASKS_1, buckets)
-  draw_ring_segmented(L2, SCREEN_PTS_2, SCREEN_MASKS_2, buckets)
-
-  screen_bucket_flush(buckets)
-
-  -- additive markers
-  if L1.additive_mode then
-    draw_additive_plus(SCREEN_LEFT_CX, SCREEN_LEFT_CY, 1)
-  end
-  if L2.additive_mode then
-    draw_additive_plus(SCREEN_RIGHT_CX, SCREEN_RIGHT_CY, 1)
-  end
 end
 
 local function screen_label_triplet(x, y,
@@ -601,13 +534,55 @@ local function ui_rate_on(L)
   return math.abs((L.rate or 1.0) - 1.0) > 0.001
 end
 
+local function motion_level(L)
+  if L.motion_recording then
+    return 15
+  elseif L.motion_has_data and L.motion_playback then
+    return 8
+  elseif L.motion_has_data then
+    return 3
+  else
+    return 1
+  end
+end
+
+-- -------------------------------------------------------------------------
+-- SCREEN DRAWING
+-- -------------------------------------------------------------------------
+
+local function draw_interlocking_loops(L1, L2)
+  local buckets = screen_bucket_init()
+
+  -- extra inner ring to thicken selected loopers
+  if L1.selected then
+    draw_ring_segmented(L1, SCREEN_PTS_1_INNER, SCREEN_MASKS_1, buckets)
+  end
+  if L2.selected then
+    draw_ring_segmented(L2, SCREEN_PTS_2_INNER, SCREEN_MASKS_2, buckets)
+  end
+
+  -- main rings
+  draw_ring_segmented(L1, SCREEN_PTS_1, SCREEN_MASKS_1, buckets)
+  draw_ring_segmented(L2, SCREEN_PTS_2, SCREEN_MASKS_2, buckets)
+
+  screen_bucket_flush(buckets)
+
+  -- additive markers
+  if L1.additive_mode then
+    draw_additive_plus(SCREEN_LEFT_CX, SCREEN_LEFT_CY, 1)
+  end
+  if L2.additive_mode then
+    draw_additive_plus(SCREEN_RIGHT_CX, SCREEN_RIGHT_CY, 1)
+  end
+end
+
 local function draw_norns_help_labels(loopers, link_playheads,
                                       k1_held, k2_held, k3_held,
                                       k1_down_time, k2_down_time, k3_down_time)
   local now = util.time()
   local delay = 0.5
 
-  local k1_show_shift = k1_held and k1_down_time ~= nil and (now - k1_down_time >= delay)
+  local k1_show_shift = k1_held
   local k2_show_shift = k2_held and k2_down_time ~= nil and (now - k2_down_time >= delay)
   local k3_show_shift = k3_held and k3_down_time ~= nil and (now - k3_down_time >= delay)
 
@@ -628,14 +603,14 @@ local function draw_norns_help_labels(loopers, link_playheads,
     tl_l3 = fmt_num(LS.overdub or 1.0)
     tl_l3_level = ui_active_level(ui_dub_on(LS))
   elseif k2_show_shift then
-    tl_l1 = "rec"
-    tl_l1_level = ui_active_level(LS.is_recording or LS.is_overdubbing)
+    tl_l1 = "sel"
+    tl_l1_level = 4
     tl_l2 = "tape"
     tl_l2_level = ui_active_level(ui_tape_on(LS))
     tl_l3 = fmt_num(LS.tape_age or 0.0)
     tl_l3_level = ui_active_level(ui_tape_on(LS))
   elseif k3_show_shift then
-    tl_l1 = "clr"
+    tl_l1 = "sel"
     tl_l1_level = 4
     tl_l2 = "drop"
     tl_l2_level = ui_active_level(ui_drop_on(LS))
@@ -666,8 +641,8 @@ local function draw_norns_help_labels(loopers, link_playheads,
     bl_l3 = fmt_num(L1.rate or 1.0)
     bl_l3_level = ui_active_level(ui_rate_on(L1))
   elseif k3_show_shift then
-    bl_l1 = "add"
-    bl_l1_level = ui_active_level(LS.additive_mode)
+    bl_l1 = "mot"
+    bl_l1_level = 4
     bl_l2 = "free1"
     bl_l2_level = ui_active_level(ui_rate_on(L1))
     bl_l3 = fmt_num(L1.rate or 1.0)
@@ -718,32 +693,20 @@ local function draw_norns_help_labels(loopers, link_playheads,
     tl_l3, tl_l3_level,
     false
   )
-  
+
   screen_label_triplet(0, 48,
     bl_l1, bl_l1_level,
     bl_l2, bl_l2_level,
     bl_l3, bl_l3_level,
     false
   )
-  
+
   screen_label_triplet(128, 48,
     br_l1, br_l1_level,
     br_l2, br_l2_level,
     br_l3, br_l3_level,
     true
   )
-end
-
-local function motion_level(L)
-  if L.motion_recording then
-    return 15
-  elseif L.motion_has_data and L.motion_playback then
-    return 8
-  elseif L.motion_has_data then
-    return 3
-  else
-    return 1
-  end
 end
 
 local function draw_status_stack(loopers, link_playheads,
@@ -760,7 +723,7 @@ local function draw_status_stack(loopers, link_playheads,
 
   -- row 1: linked playheads
   screen.level(link_playheads and 10 or 1)
-  screen.move(x+1, y0)
+  screen.move(x + 1, y0)
   screen.font_size(11)
   screen.text_right("∞")
   screen.font_size(8)
@@ -773,20 +736,20 @@ local function draw_status_stack(loopers, link_playheads,
   local x_left  = x - 8
   local x_mid   = x - 4
   local x_right = x - 0
-  
+
   -- faint scaffold
   screen.level(2)
   screen.move(x_left,  y_send) screen.text("<")
   screen.move(x_mid,   y_send) screen.text("-")
   screen.move(x_right, y_send) screen.text(">")
-  
+
   -- brighten active directions exactly on top
   if s21 then
     screen.level(10)
     screen.move(x_left, y_send) screen.text("<")
     screen.move(x_mid,  y_send) screen.text("-")
   end
-  
+
   if s12 then
     screen.level(10)
     screen.move(x_mid,   y_send) screen.text("-")
@@ -829,9 +792,9 @@ function ui.redraw(loopers, g, a, link_playheads,
   screen.update()
 end
 
--- ------------------------------------------------------------------
--- grid drawing
--- ------------------------------------------------------------------
+-- -------------------------------------------------------------------------
+-- GRID DRAWING
+-- -------------------------------------------------------------------------
 
 function ui.grid_redraw(g, loopers, link_playheads,
                         send_1_to_2, send_2_to_1,
@@ -842,7 +805,7 @@ function ui.grid_redraw(g, loopers, link_playheads,
   if not g or not g.device then return end
 
   local L = strip_source_looper(loopers)
-  
+
   local t = util.time()
 
   g:all(0)
@@ -859,30 +822,81 @@ function ui.grid_redraw(g, loopers, link_playheads,
   local filter_selected_y = ui.grid_get_nearest_yval(L.dj_filter_freq, defs.FILTER_VALUES)
   ui.grid_strip(g, defs.FILTER_COL, filter_selected_y, true, -1, 15)
 
-  local stp_speed_selected_y = ui.grid_get_nearest_yval(L.rate, defs.STP_SPEED_VALUES)
+  local stp_speed_selected_y = ui.grid_get_nearest_yval(math.abs(L.rate), defs.STP_SPEED_VALUES)
   ui.grid_strip(g, defs.STP_SPEED_COL, stp_speed_selected_y, true, -1, 15)
-  
+
   local dropper_selected_y = ui.grid_get_nearest_yval(L.dropper_amt, defs.DROPPER_VALUES)
   ui.grid_strip(g, defs.DROPPER_COL, dropper_selected_y, false, -1, 15)
-  
+
   local jump_target_y = nil
+  local jump_target_is_shift = false
   for y = 5, 8 do
-    if defs.JUMP_TARGET_VALUES[y] == L.jump_div then
+    if defs.JUMP_TARGET_VALUES_SHIFT[y] == L.jump_div then
       jump_target_y = y
+      jump_target_is_shift = true
+      break
+    elseif defs.JUMP_TARGET_VALUES[y] == L.jump_div then
+      jump_target_y = y
+      jump_target_is_shift = false
       break
     end
   end
 
   local jump_trigger_y = nil
-  for y = 1, 4 do
-    if defs.JUMP_TRIGGER_VALUES[y] == (L.jump_trigger_div or 0) then
-      jump_trigger_y = y
-      break
+  local jump_trigger_is_shift = false
+  if L.jump_trigger_enabled then
+    for y = 1, 4 do
+      if defs.JUMP_TRIGGER_VALUES_SHIFT[y] == (L.jump_trigger_div or 0) then
+        jump_trigger_y = y
+        jump_trigger_is_shift = true
+        break
+      elseif defs.JUMP_TRIGGER_VALUES[y] == (L.jump_trigger_div or 0) then
+        jump_trigger_y = y
+        jump_trigger_is_shift = false
+        break
+      end
     end
   end
 
-  ui.split_grid_strip(g, defs.JUMP_COL, jump_target_y, jump_trigger_y, -1, 15)
-  
+  local top_dim = jump_target_is_shift and 10 or 5
+  local top_bright = jump_target_is_shift and 15 or 12
+
+  local bottom_dim = jump_trigger_is_shift and 10 or 5
+  local bottom_bright = jump_trigger_is_shift and 15 or 12
+
+  ui.split_grid_strip(
+    g,
+    defs.JUMP_COL,
+    jump_target_y,
+    jump_trigger_y,
+    -1,
+    15
+  )
+
+  -- redraw top half with custom brightness for shift-vs-normal target values
+  if jump_target_y ~= nil then
+    for y = 5, 8 do
+      local level = 0
+      if y >= jump_target_y then
+        level = (y == jump_target_y) and top_bright or top_dim
+      end
+      g:led(defs.JUMP_COL, y, level)
+    end
+  end
+
+  -- redraw bottom half with custom brightness for shift-vs-normal trigger values
+  if jump_trigger_y ~= nil then
+    for y = 1, 4 do
+      local level = 0
+      if y >= jump_trigger_y then
+        level = (y == jump_trigger_y) and bottom_bright or bottom_dim
+      end
+      g:led(defs.JUMP_COL, y, level)
+    end
+  else
+    g:led(defs.JUMP_COL, 4, 2)
+  end
+
   local function ring_levels(L)
     local dimval, cropval
     if L.selected then
@@ -909,18 +923,18 @@ function ui.grid_redraw(g, loopers, link_playheads,
     defs.LEFT_RING_TOPRIGHT[1], defs.LEFT_RING_TOPRIGHT[2],
     l1_dim, l1_crop, 12, 15, 1
   )
-  
+
   ui.grid_tapehead_viz(
     g, 2, loopers[2],
     defs.RIGHT_RING_TOPRIGHT[1], defs.RIGHT_RING_TOPRIGHT[2],
     l2_dim, l2_crop, 12, 15, -1
   )
-  
+
   local s = 0.5 + 0.5 * math.sin(2 * math.pi * 1.0 * t)
   ui.grid_led_any(g, defs.LINK_PLAYHEADS_KEY, link_playheads and math.floor(1 + s * 3) or 0)
 
   -- ui.grid_led_any(g, defs.LINK_PLAYHEADS_KEY, link_playheads and 2 or 0)
-  
+
   ui.grid_led_any(g, defs.SEND_1_TO_2_KEY, send_1_to_2_enabled and math.floor(1 + s * 3) or 0)
   ui.grid_led_any(g, defs.SEND_2_TO_1_KEY, send_2_to_1_enabled and math.floor(1 + s * 3) or 0)
 
@@ -951,13 +965,13 @@ function ui.grid_redraw(g, loopers, link_playheads,
   elseif L.rate_slew_mode == 2 then
     slew_led = 12
   end
-  
+
   g:led(defs.RATE_SLEW_KEY[1], defs.RATE_SLEW_KEY[2], slew_led)
 
   g:led(defs.REC_KEY[1], defs.REC_KEY[2], (L.is_recording or L.is_overdubbing) and 15 or 4)
   g:led(defs.MOD_SHIFT_KEY[1], defs.MOD_SHIFT_KEY[2], mod_shift_held and 8 or 2)
   g:led(defs.SHIFT_KEY[1], defs.SHIFT_KEY[2], shift_held and 8 or 3)
-  
+
   local snap_level = 1
   if snapshot_1_filled and snapshot_2_filled then
     snap_level = 15
@@ -966,7 +980,7 @@ function ui.grid_redraw(g, loopers, link_playheads,
   elseif snapshot_1_filled then
     snap_level = 8
   end
-  
+
   if snapshot_flash_kind == "store" then
     snap_level = 10
   elseif snapshot_flash_kind == "recall" then
@@ -978,7 +992,7 @@ function ui.grid_redraw(g, loopers, link_playheads,
   elseif snapshot_flash_kind == "delete" then
     snap_level = 0
   end
-  
+
   g:led(defs.SNAPSHOT_KEY[1], defs.SNAPSHOT_KEY[2], snap_level)
 
   g:led(defs.CLEAR_KEY[1], defs.CLEAR_KEY[2], 4)
@@ -986,9 +1000,9 @@ function ui.grid_redraw(g, loopers, link_playheads,
   g:refresh()
 end
 
---------------------------------------------
+-- -------------------------------------------------------------------------
 -- ARC
---------------------------------------------
+-- -------------------------------------------------------------------------
 
 local function arc_rot(idx)
   return util.wrap(idx - 16, 1, 64)

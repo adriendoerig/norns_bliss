@@ -1,6 +1,25 @@
+-- bliss
+--
+-- two entertwined loopers
+--
+--    make them evolve 
+--    make the collide.
+-- 
+-- version: 0.1.0
+--
+-- author: Adrien Doerig @irbis
+
+-- -------------------------------------------------------------------------
+-- LOCAL LIBRARIES
+-- -------------------------------------------------------------------------
+
 local defs = include("lib/looper_defs")
 local looper_engine = include("lib/looper_engine")
 local looper_ui = include("lib/looper_ui")
+
+-- -------------------------------------------------------------------------
+-- STATE
+-- -------------------------------------------------------------------------
 
 local g
 local a
@@ -16,14 +35,13 @@ local loopers = {
 
 local link_playheads = false
 
-local send_1_to_2 = 0.707 -- default is quite high
-local send_2_to_1 = 0.707 -- default is quite high
+local send_1_to_2 = 0.33 -- default is quite high
+local send_2_to_1 = 0.33 -- default is quite high
 local send_1_to_2_enabled = false
 local send_2_to_1_enabled = false
 
 local snapshot_1 = nil
 local snapshot_2 = nil
-local snapshot_mode_active = false
 local snapshot_mode_delete = false
 local snapshot_mode_overwrite = false
 local snapshot_key_held = false
@@ -51,12 +69,13 @@ local trigger_snapshot_flash
 local refresh_routing
 local restore_performance_state
 
+-- -------------------------------------------------------------------------
+-- HELPERS
+-- -------------------------------------------------------------------------
+
 local function long_hold_shown(down_time)
   return down_time ~= nil and (util.time() - down_time >= KEY_INFO_DELAY)
 end
-
-
--- -------- helper functions --------
 
 local function redraw_all()
   redraw()
@@ -73,14 +92,9 @@ local function redraw_all()
   looper_ui.arc_redraw(a, loopers, arc_page, send_1_to_2, send_2_to_1)
 end
 
-local function active_looper()
-  for _, L in ipairs(loopers) do
-    if L.selected then
-      return L
-    end
-  end
-  return loopers[1]
-end
+-- -------------------------------------------------------------------------
+-- PERFORMANCE STATE / SNAPSHOTS
+-- -------------------------------------------------------------------------
 
 local function capture_looper_state(L)
   return {
@@ -140,14 +154,6 @@ local function capture_performance_state()
     send_1_to_2_enabled = send_1_to_2_enabled,
     send_2_to_1_enabled = send_2_to_1_enabled,
   }
-end
-
-local function copy_state(state)
-  return tab.deepcopy(state)
-end
-
-local function get_current_state_copy()
-  return copy_state(capture_performance_state())
 end
 
 local function restore_looper_state(L, s)
@@ -239,7 +245,7 @@ local function restore_looper_state(L, s)
   looper_engine.update_output_mix(L)
 end
 
-restore_performance_state = function (state)
+restore_performance_state = function(state)
   if state == nil then return end
 
   restore_looper_state(loopers[1], state.loopers[1])
@@ -380,6 +386,10 @@ trigger_snapshot_flash = function(kind)
   end)
 end
 
+-- -------------------------------------------------------------------------
+-- ROUTING / RESET
+-- -------------------------------------------------------------------------
+
 refresh_routing = function()
   looper_engine.update_all_routing(
     loopers,
@@ -401,11 +411,11 @@ local function reset_all()
   link_playheads = false
   shift_held = false
 
-  send_1_to_2 = 0.0
-  send_2_to_1 = 0.0
+  send_1_to_2 = 0.33
+  send_2_to_1 = 0.33
   send_1_to_2_enabled = false
   send_2_to_1_enabled = false
-  
+
   snapshot_1 = nil
   snapshot_2 = nil
 
@@ -419,8 +429,8 @@ local function clear_modifiers_all()
   end
 
   link_playheads = false
-  send_1_to_2 = 0.0
-  send_2_to_1 = 0.0
+  send_1_to_2 = 0.33
+  send_2_to_1 = 0.33
   send_1_to_2_enabled = false
   send_2_to_1_enabled = false
 
@@ -428,26 +438,77 @@ local function clear_modifiers_all()
   redraw_all()
 end
 
+-- -------------------------------------------------------------------------
+-- PARAMETER ADJUSTMENTS
+-- -------------------------------------------------------------------------
+
 local function stepped_speed_targets()
   return {0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0}
 end
 
-local function apply_free_speed(L, d)
-  L.rate = util.clamp(L.rate + d * 0.005, -4.0, 4.0)
+local function motion_or_live_rate(L)
+  if L.motion_recording and L.motion_recorded_rate ~= nil then
+    return L.motion_recorded_rate
+  end
+  return L.rate
+end
 
-  if math.abs(L.rate) < 0.001 then
-    L.rate = 0
+local function motion_or_live_is_reversed(L)
+  if L.motion_recording and L.motion_recorded_is_reversed ~= nil then
+    return L.motion_recorded_is_reversed
+  end
+  return L.is_reversed
+end
+
+local function set_signed_rate(L, signed_rate)
+  signed_rate = util.clamp(signed_rate, -4.0, 4.0)
+
+  if math.abs(signed_rate) < 0.001 then
+    signed_rate = 0
   end
 
-  L.is_reversed = (L.rate < 0)
+  local pending_is_reversed = (signed_rate < 0)
+
+  if L.motion_recording then
+    L.motion_recorded_rate = signed_rate
+    L.motion_recorded_is_reversed = pending_is_reversed
+
+    local live_mag = math.abs(signed_rate)
+    L.rate = L.is_reversed and -live_mag or live_mag
+    looper_engine.apply_rate(L)
+    return
+  end
+
+  L.rate = signed_rate
+  L.is_reversed = pending_is_reversed
   looper_engine.apply_rate(L)
+end
+
+local function toggle_reverse_state(L)
+  if L.motion_recording then
+    local new_is_reversed = not motion_or_live_is_reversed(L)
+    local mag = math.abs(motion_or_live_rate(L))
+    L.motion_recorded_is_reversed = new_is_reversed
+    L.motion_recorded_rate = new_is_reversed and -mag or mag
+    return
+  end
+
+  L.is_reversed = not L.is_reversed
+  L.rate = L.is_reversed and -math.abs(L.rate) or math.abs(L.rate)
+  looper_engine.apply_rate(L)
+end
+
+local function apply_free_speed(L, d)
+  local rate = motion_or_live_rate(L)
+  set_signed_rate(L, rate + d * 0.005)
 end
 
 local function apply_stepped_speed(L, d)
   local targets = stepped_speed_targets()
 
-  local sign = (L.rate < 0) and -1 or 1
-  local mag = math.abs(L.rate)
+  local rate = motion_or_live_rate(L)
+  local sign = (rate < 0) and -1 or 1
+  local mag = math.abs(rate)
   if mag < 0.001 then mag = 1.0 end
 
   local best_i = 1
@@ -466,9 +527,7 @@ local function apply_stepped_speed(L, d)
     best_i = math.max(1, best_i - 1)
   end
 
-  L.rate = sign * targets[best_i]
-  L.is_reversed = (L.rate < 0)
-  looper_engine.apply_rate(L)
+  set_signed_rate(L, sign * targets[best_i])
 end
 
 local function adjust_selected_drywet(d)
@@ -523,6 +582,10 @@ local function apply_free_speed_for_looper(idx, d)
   apply_free_speed(loopers[idx], d)
 end
 
+-- -------------------------------------------------------------------------
+-- Norns KEYS / ENCODERS
+-- -------------------------------------------------------------------------
+
 local function all_keys_held()
   return k1_held and k2_held and k3_held
 end
@@ -568,9 +631,8 @@ function key(n, z)
         k2_consumed = true
         k3_consumed = true
         looper_engine.for_each_selected(loopers, function(L)
-          looper_engine.toggle_additive_mode(L)
+          looper_engine.motion_key_press(L)
         end)
-        refresh_routing()
         redraw()
         return
       end
@@ -694,6 +756,10 @@ function enc(n, d)
   end
 end
 
+-- -------------------------------------------------------------------------
+-- LOOP / RING HELPERS
+-- -------------------------------------------------------------------------
+
 local function handle_ring_key(L, ring_idx, z)
   if z == 1 then
     L.held_ring_points[ring_idx] = true
@@ -742,13 +808,11 @@ local function sync_linked_playheads()
   L2.play_pos = pos2
 end
 
---------------------------------------------
+-- -------------------------------------------------------------------------
 -- GRID
---------------------------------------------
+-- -------------------------------------------------------------------------
 
 local function grid_key(x, y, z)
-  local L = active_looper()
-
   if x == defs.DRYWET_COL and z == 1 then
     local val = defs.DRYWET_VALUES[y]
     if val ~= nil then
@@ -760,7 +824,7 @@ local function grid_key(x, y, z)
     return
   end
 
-    if x == defs.OVERDUB_COL and z == 1 then
+  if x == defs.OVERDUB_COL and z == 1 then
     local val = defs.OVERDUB_VALUES[y]
     if val ~= nil then
       looper_engine.for_each_selected(loopers, function(LL)
@@ -799,14 +863,14 @@ local function grid_key(x, y, z)
     local val = defs.STP_SPEED_VALUES[y]
     if val ~= nil then
       looper_engine.for_each_selected(loopers, function(LL)
-        LL.rate = val
-        looper_engine.apply_rate(LL)
+        local sign = motion_or_live_is_reversed(LL) and -1 or 1
+        set_signed_rate(LL, sign * val)
       end)
       redraw_all()
     end
     return
   end
-  
+
   if x == defs.DROPPER_COL and z == 1 then
     local val = defs.DROPPER_VALUES[y]
     if val ~= nil then
@@ -817,11 +881,14 @@ local function grid_key(x, y, z)
     end
     return
   end
-  
+
   if x == defs.JUMP_COL and z == 1 then
-    local target_val = defs.JUMP_TARGET_VALUES[y]
-    local trigger_val = defs.JUMP_TRIGGER_VALUES[y]
-  
+    local target_vals = shift_held and defs.JUMP_TARGET_VALUES_SHIFT or defs.JUMP_TARGET_VALUES
+    local trigger_vals = shift_held and defs.JUMP_TRIGGER_VALUES_SHIFT or defs.JUMP_TRIGGER_VALUES
+
+    local target_val = target_vals[y]
+    local trigger_val = trigger_vals[y]
+
     if target_val ~= nil then
       looper_engine.for_each_selected(loopers, function(LL)
         looper_engine.set_jump_div(LL, target_val)
@@ -829,16 +896,33 @@ local function grid_key(x, y, z)
       redraw_all()
       return
     end
-  
+
     if trigger_val ~= nil then
       looper_engine.for_each_selected(loopers, function(LL)
-        looper_engine.set_jump_trigger_div(LL, trigger_val)
+        local current_div = LL.jump_trigger_div or 0
+        local pressed_normal = defs.JUMP_TRIGGER_VALUES[y]
+        local pressed_shift = defs.JUMP_TRIGGER_VALUES_SHIFT[y]
+
+        local is_same_as_current =
+          LL.jump_trigger_enabled and
+          (
+            current_div == pressed_normal or
+            current_div == pressed_shift
+          )
+
+        if is_same_as_current then
+          LL.jump_trigger_enabled = false
+          looper_engine.set_jump_trigger_div(LL, 0)
+        else
+          LL.jump_trigger_enabled = true
+          looper_engine.set_jump_trigger_div(LL, trigger_val)
+        end
       end)
       redraw_all()
       return
     end
   end
-  
+
   local left_ring_idx = looper_ui.grid_ring_hit(
     x, y, 1,
     defs.LEFT_RING_TOPRIGHT[1], defs.LEFT_RING_TOPRIGHT[2]
@@ -860,7 +944,7 @@ local function grid_key(x, y, z)
     redraw_all()
     return
   end
-  
+
   if looper_ui.grid_match_any(x, y, defs.LOOPER1_SELECT_KEY) and z == 1 then
     if shift_held then
       looper_engine.select_exclusive(loopers, 1)
@@ -880,31 +964,31 @@ local function grid_key(x, y, z)
     redraw_all()
     return
   end
-  
+
   if looper_ui.grid_match_any(x, y, defs.LINK_PLAYHEADS_KEY) and z == 1 then
     link_playheads = not link_playheads
     sync_linked_playheads()
     redraw_all()
     return
   end
-  
+
   if looper_ui.grid_match_any(x, y, defs.SEND_1_TO_2_KEY) and z == 1 then
     send_1_to_2_enabled = not send_1_to_2_enabled
     refresh_routing()
     redraw_all()
     return
   end
-  
+
   if looper_ui.grid_match_any(x, y, defs.SEND_2_TO_1_KEY) and z == 1 then
     send_2_to_1_enabled = not send_2_to_1_enabled
     refresh_routing()
     redraw_all()
     return
   end
-  
+
   if x == defs.MOTION1_KEY[1] and y == defs.MOTION1_KEY[2] and z == 1 then
     local L = loopers[1]
-  
+
     if shift_held then
       looper_engine.clear_motion(L)
     elseif mod_shift_held then
@@ -917,14 +1001,14 @@ local function grid_key(x, y, z)
     else
       looper_engine.motion_key_press(L)
     end
-  
+
     redraw_all()
     return
   end
-  
+
   if x == defs.MOTION2_KEY[1] and y == defs.MOTION2_KEY[2] and z == 1 then
     local L = loopers[2]
-  
+
     if shift_held then
       looper_engine.clear_motion(L)
     elseif mod_shift_held then
@@ -937,7 +1021,7 @@ local function grid_key(x, y, z)
     else
       looper_engine.motion_key_press(L)
     end
-  
+
     redraw_all()
     return
   end
@@ -953,8 +1037,7 @@ local function grid_key(x, y, z)
 
   if looper_ui.grid_match_any(x, y, defs.REVERSE_KEY) and z == 1 then
     looper_engine.for_each_selected(loopers, function(LL)
-      LL.is_reversed = not LL.is_reversed
-      looper_engine.apply_rate(LL)
+      toggle_reverse_state(LL)
     end)
     redraw_all()
     return
@@ -980,8 +1063,22 @@ local function grid_key(x, y, z)
       redraw_all()
       return
     end
-  
+
     if z == 1 then
+      if shift_held and mod_shift_held then
+        looper_engine.for_each_selected(loopers, function(LL)
+          if LL.has_loop then
+            softcut.play(LL.play_voice, 1)
+            softcut.play(LL.write_voice, 1)
+            looper_engine.apply_rate(LL)
+            looper_engine.apply_write_mode(LL)
+          end
+        end)
+        refresh_routing()
+        redraw_all()
+        return
+      end
+
       looper_engine.for_each_selected(loopers, function(LL)
         looper_engine.toggle(LL)
       end)
@@ -990,42 +1087,42 @@ local function grid_key(x, y, z)
       return
     end
   end
-  
+
   if x == defs.SNAPSHOT_KEY[1] and y == defs.SNAPSHOT_KEY[2] then
     snapshot_key_held = (z == 1)
-  
+
     if z == 1 then
       clear_snapshot_modes()
     else
       clear_snapshot_modes()
     end
-  
+
     redraw_all()
     return
   end
-  
+
   if x == defs.MOD_SHIFT_KEY[1] and y == defs.MOD_SHIFT_KEY[2] then
     mod_shift_held = (z == 1)
-  
+
     if z == 1 and snapshot_key_held then
       if try_snapshot_mode_action() then
         return
       end
     end
-  
+
     redraw_all()
     return
   end
-  
+
   if x == defs.SHIFT_KEY[1] and y == defs.SHIFT_KEY[2] then
     shift_held = (z == 1)
-  
+
     if z == 1 and snapshot_key_held then
       if try_snapshot_mode_action() then
         return
       end
     end
-  
+
     redraw_all()
     return
   end
@@ -1041,9 +1138,31 @@ local function grid_key(x, y, z)
       redraw_all()
       return
     end
-  
+
     if z == 1 then
-      if shift_held then
+      if shift_held and mod_shift_held then
+        looper_engine.for_each_selected(loopers, function(LL)
+          LL.is_recording = false
+          LL.is_overdubbing = false
+          LL.rec_start_time = 0
+
+          softcut.rec(LL.play_voice, 0)
+          softcut.rec(LL.write_voice, 0)
+
+          softcut.rec_level(LL.play_voice, 0.0)
+          softcut.rec_level(LL.write_voice, 0.0)
+
+          softcut.pre_level(LL.play_voice, 1.0)
+          softcut.pre_level(LL.write_voice, 1.0)
+
+          softcut.play(LL.play_voice, 0)
+          softcut.play(LL.write_voice, 0)
+
+          softcut.level_cut_cut(LL.play_voice, LL.write_voice, 0.0)
+        end)
+        refresh_routing()
+        redraw_all()
+      elseif shift_held then
         reset_all()
       elseif mod_shift_held then
         clear_modifiers_all()
@@ -1058,12 +1177,11 @@ local function grid_key(x, y, z)
       return
     end
   end
-  
 end
 
---------------------------------------------
+-- -------------------------------------------------------------------------
 -- ARC
---------------------------------------------
+-- -------------------------------------------------------------------------
 
 local function arc_key(n, z)
   if z ~= 1 then return end
@@ -1073,9 +1191,9 @@ end
 
 local function snap_rate_with_dents(r)
   local targets = {
-    -4.0, -3.0, -2.0, -1.5, -1.0, -0.75, -0.5, -0.25, 
+    -4.0, -3.0, -2.0, -1.5, -1.0, -0.75, -0.5, -0.25,
     0,
-     0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0
+    0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0
   }
 
   local snap_width = 0.005
@@ -1121,32 +1239,24 @@ local function arc_delta(n, d)
   elseif arc_page == 2 then
     if n == 1 then
       local L = loopers[1]
-      L.rate = util.clamp(L.rate + d * 0.005, -4.0, 4.0)
-      L.rate = snap_rate_with_dents(L.rate)
-
-      -- if math.abs(L.rate) < 0.001 then
-      --   L.rate = 0.001
-      -- end
-
-      L.is_reversed = (L.rate < 0)
-      looper_engine.apply_rate(L)
-
+      local rate = motion_or_live_rate(L)
+      set_signed_rate(L, rate + d * 0.005)
+      local snapped = motion_or_live_rate(L)
+      snapped = snap_rate_with_dents(snapped)
+      set_signed_rate(L, snapped)
+  
     elseif n == 2 then
       local L = loopers[2]
-      L.rate = util.clamp(L.rate + d * 0.005, -4.0, 4.0)
-      L.rate = snap_rate_with_dents(L.rate)
-
-      -- if math.abs(L.rate) < 0.001 then
-      --   L.rate = 0.001
-      -- end
-
-      L.is_reversed = (L.rate < 0)
-      looper_engine.apply_rate(L)
-
+      local rate = motion_or_live_rate(L)
+      set_signed_rate(L, rate + d * 0.005)
+      local snapped = motion_or_live_rate(L)
+      snapped = snap_rate_with_dents(snapped)
+      set_signed_rate(L, snapped)
+  
     elseif n == 3 then
       send_1_to_2 = util.clamp(send_1_to_2 + d * 0.0005, 0.0, 1.0)
       refresh_routing()
-
+  
     elseif n == 4 then
       send_2_to_1 = util.clamp(send_2_to_1 + d * 0.0005, 0.0, 1.0)
       refresh_routing()
@@ -1167,9 +1277,9 @@ local function arc_delta(n, d)
   looper_ui.arc_redraw(a, loopers, arc_page, send_1_to_2, send_2_to_1)
 end
 
---------------------------------------------
--- INIT, REDRAW, CLEANUP
---------------------------------------------
+-- -------------------------------------------------------------------------
+-- INIT / REDRAW / CLEANUP
+-- -------------------------------------------------------------------------
 
 function init()
   looper_engine.setup_softcut(loopers)
@@ -1180,7 +1290,7 @@ function init()
   softcut.poll_start_phase()
 
   viz_metro = metro.init()
-  viz_metro.time = 1/20
+  viz_metro.time = 1 / 20
   viz_metro.event = function()
     for _, L in ipairs(loopers) do
       looper_engine.apply_tape_warble(L, viz_metro.time)

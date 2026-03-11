@@ -42,7 +42,7 @@ The script is designed to feel like an instrument rather than a list of paramete
 
 1. Connect **grid** and **arc**.
 2. Launch `bliss` on norns.
-3. Press **K2** to record the selected looper(s). Press again to stop.
+3. Press **K2** to record the selected looper(s). Press again to stop recording / start overdub; press again to stop overdub.
 4. Use the ring areas on grid or page 1 on arc to move the playhead and crop the loop.
 5. Shape the selected looper(s) from the grid columns.
 6. Add speed, sends, or filtering from arc pages 2 and 3.
@@ -57,12 +57,11 @@ Most parameter changes apply to the **selected looper(s)**. You can select one l
 
 ### Keys
 
-- **K2 tap**: record / stop on selected looper(s)
+- **K2 tap**: record / stop / overdub on selected looper(s)
 - **K3 tap**: clear selected looper(s)
 - **K1 + K2**: toggle selection of looper 1
 - **K1 + K3**: toggle selection of looper 2
-- **K2(hold) + K3**: toggle additive mode on looper 2
-- **K3(hold) + K2**: toggle additive mode on looper 1
+- **K2 + K3**: toggle additive mode on selected looper(s) if **K3** is the second key pressed; start motion recording on selected looper(s) if **K2** is the second key pressed
 - **K1 + K2 + K3**: reset everything
 
 ### Encoders
@@ -131,7 +130,7 @@ Motion capture is represented by two dots (one per looper).
 
 ### Utility column 16
 
-- **16,8**: record / stop selected looper(s)
+- **16,8**: record / stop / overdub selected looper(s)
 - **16,7**: reverse
 - **16,6**: rate slew cycle (`off -> short -> long -> off`)
 - **16,5**: additive mode
@@ -142,7 +141,7 @@ Motion capture is represented by two dots (one per looper).
 
 ### Clear / shift actions
 
-- **clear**: clear selected looper(s)
+- **clear**: clear selected looper(s) and clear their motion capture
 - **shift + clear**: full reset
 - **mod shift + clear**: clear modifiers
 
@@ -168,8 +167,8 @@ Each looper has its own motion recorder. Over the course of one loop, you can re
 - *motion capture key*: start recording a new one-loop motion pass
 - *press again while recording*: stop early and start playback
 - *after one full loop*, recording stops automatically and playback begins
-- *press again during playback* to overwrite
-- *mod shift -> motion capture*: pause playback
+- *press again during playback* to record a new pass
+- *mod shift -> motion capture*: pause / resume playback
 - *shift -> motion capture*: clear motion capture
 
 Motion capture status is visible on norns; recording, playback, and stored-but-stopped states are shown as dots at different brightness levels in the top right of the screen.
@@ -217,7 +216,7 @@ The grid mirrors the same logic in a more performance-oriented way.
 ## Tips
 
 - Start simple: record one loop in each looper, then explore crop and speed.
-- Linked playheads is great for synced loops, and will timestretch loop 2 to match loop 1 if the two loop lengths differ.
+- Linked playheads is great for synced loops, and will keep looper 2 phase-locked to looper 1.
 - Additive mode combined with overdub increases the intensity of applied modifiers on each loop pass. For example, if you are speeding up the loop, it get sped up again at every pass.
 
 ## Status
