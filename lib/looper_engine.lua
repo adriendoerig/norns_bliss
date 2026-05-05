@@ -2,6 +2,8 @@ local defs = include("lib/looper_defs")
 
 local engine = {}
 
+engine.input_gain = 1.0
+
 -- -------------------------------------------------------------------------
 -- LOOPER STATE / CONSTRUCTION
 -- -------------------------------------------------------------------------
@@ -44,6 +46,7 @@ function engine.reset_looper_state(L)
   L.full_loop_start = 0.0
   L.full_loop_end = 1.0
   L.play_pos = 0.0
+  L.write_pos = 0.0
 
   L.crop_start = 0.0
   L.crop_len = 1.0
@@ -63,8 +66,12 @@ function engine.reset_looper_state(L)
   L.motion_playback = false
   L.motion_recording = false
   L.motion_data = {}
-  L.motion_last_step = nil
-  L.motion_record_start_step = nil
+  L.motion_initial_state = {}
+  L.motion_start_state = {}
+  L.motion_time_start = nil
+  L.motion_duration = nil
+  L.motion_last_tick = nil
+  L.motion_advancing = false
   
   L.clock_loop_ticks = nil
   L.clock_record_ticks = 0
@@ -137,6 +144,11 @@ function engine.reset_looper(L)
   softcut.loop_start(L.write_voice, 0.0)
   softcut.loop_end(L.write_voice, 1.0)
   softcut.position(L.write_voice, 0.0)
+  
+  L.scrub_continue = false
+  L.scrub_velocity = 0.0
+  L.scrub_last_arc_time = nil
+  L.scrub_last_arc_n = nil
 
   engine.apply_rate(L)
   engine.apply_rate_slew(L)
@@ -162,6 +174,20 @@ function engine.update_phase_quant(L)
   softcut.phase_quant(L.play_voice, loop_len / defs.PHASE_STEPS)
 end
 
+local function apply_loop_fade(L)
+  local rate_mag = math.max(math.abs(L.rate or 1.0), 1.0)
+  local loop_len = math.max((L.loop_end or 1.0) - (L.loop_start or 0.0), defs.MIN_LEN)
+
+  -- Play voice: compensate for faster read speed.
+  local play_fade = math.min(defs.FADE * rate_mag, loop_len * 0.5)
+
+  -- Write voice: keep boring/stable, but never longer than half the loop.
+  local write_fade = math.min(defs.FADE, loop_len * 0.5)
+
+  softcut.fade_time(L.play_voice, play_fade)
+  softcut.fade_time(L.write_voice, write_fade)
+end
+
 function engine.set_loop_bounds(L, start_pos, end_pos)
   L.loop_start = start_pos
   L.loop_end = end_pos
@@ -171,6 +197,7 @@ function engine.set_loop_bounds(L, start_pos, end_pos)
   softcut.loop_start(L.write_voice, start_pos)
   softcut.loop_end(L.write_voice, end_pos)
 
+  apply_loop_fade(L)
   engine.update_phase_quant(L)
 end
 
@@ -178,6 +205,22 @@ function engine.set_loop_position(L, pos)
   softcut.position(L.play_voice, pos)
   softcut.position(L.write_voice, pos)
   L.play_pos = pos
+  L.write_pos = pos
+end
+
+function engine.move_playhead_full_loop_from_pos(L, source_pos, delta_frac)
+  local full_len = engine.get_full_len(L)
+
+  local p = (source_pos - L.full_loop_start) / full_len
+  p = p % 1.0
+  if p < 0 then p = p + 1.0 end
+
+  p = (p + delta_frac) % 1.0
+  if p < 0 then p = p + 1.0 end
+
+  local new_pos = L.full_loop_start + p * full_len
+  engine.set_loop_position(L, new_pos)
+  return new_pos
 end
 
 function engine.setup_voice_pair(L)
@@ -208,6 +251,7 @@ function engine.setup_voice_pair(L)
 
   softcut.rate(L.write_voice, 1.0)
   softcut.rate_slew_time(L.write_voice, 0.0)
+  softcut.recpre_slew_time(L.write_voice, 0.02)
 
   softcut.post_filter_dry(L.write_voice, 1.0)
   softcut.post_filter_lp(L.write_voice, 0.0)
@@ -236,12 +280,12 @@ function engine.setup_voice_pair(L)
 
   audio.level_adc_cut(1.0)
 
-  softcut.level_input_cut(1, L.write_voice, 0.707)
-  softcut.level_input_cut(2, L.write_voice, 0.707)
-
+  softcut.level_input_cut(1, L.write_voice, 0.707 * engine.input_gain)
+  softcut.level_input_cut(2, L.write_voice, 0.707 * engine.input_gain)
+  
   softcut.level_input_cut(1, L.play_voice, 0.0)
   softcut.level_input_cut(2, L.play_voice, 0.0)
-
+  
   softcut.level_cut_cut(L.play_voice, L.write_voice, 0.0)
   softcut.voice_sync(L.write_voice, L.play_voice, 0)
 end
@@ -261,7 +305,7 @@ end
 -- -------------------------------------------------------------------------
 
 function engine.update_output_mix(L)
-  audio.level_adc(L.dry_level)
+  audio.level_adc(L.dry_level * engine.input_gain)
   softcut.level(L.play_voice, L.wet_level * L.dropper_gain)
 end
 
@@ -326,7 +370,13 @@ end
 function engine.apply_tape_warble(L, dt)
   local base_rate = L.is_reversed and -math.abs(L.rate) or math.abs(L.rate)
 
-  if L.additive_mode and L.is_overdubbing then
+  -- Tape warble is safe as a playback effect, but during active overdub it
+  -- makes the audible read head drift/jitter relative to the steady write head.
+  -- That can create sizzling/comb-like artifacts in the recorded loop.
+  if L.is_overdubbing then
+    L.tape_drift = 0.0
+    L.tape_wow_freq_jitter = 0.0
+    L.tape_flutter_freq_jitter = 0.0
     softcut.rate(L.play_voice, base_rate)
     return
   end
@@ -372,6 +422,7 @@ end
 
 function engine.apply_rate(L)
   engine.apply_tape_warble(L, 0)
+  apply_loop_fade(L)
 end
 
 function engine.apply_rate_slew(L)
@@ -417,7 +468,7 @@ function engine.apply_dropper(L, dt)
     end
   end
 
-  local fade_hz = 10.0
+  local fade_hz = 7.0
   local alpha = math.min(1.0, fade_hz * dt)
   L.dropper_gain = L.dropper_gain + (L.dropper_target_gain - L.dropper_gain) * alpha
 
@@ -427,6 +478,19 @@ end
 -- -------------------------------------------------------------------------
 -- RECORD / OVERDUB / ROUTING
 -- -------------------------------------------------------------------------
+
+function engine.set_input_gain(loopers, gain)
+  engine.input_gain = util.clamp(gain or 1.0, 0.0, 2.0)
+
+  for _, L in ipairs(loopers) do
+    softcut.level_input_cut(1, L.write_voice, 0.707 * engine.input_gain)
+    softcut.level_input_cut(2, L.write_voice, 0.707 * engine.input_gain)
+
+    -- keep play voices isolated from live input
+    softcut.level_input_cut(1, L.play_voice, 0.0)
+    softcut.level_input_cut(2, L.play_voice, 0.0)
+  end
+end
 
 function engine.apply_write_mode(L)
   if not L.is_overdubbing then
@@ -500,11 +564,11 @@ function engine.start_recording(L)
 
   engine.set_loop_bounds(L, 0.0, defs.MAX_LEN)
   engine.set_loop_position(L, 0.0)
-
-  softcut.play(L.play_voice, 1)
+  
+  softcut.play(L.play_voice, 0) -- mute play voice during furst recording to avoid artifacts
   softcut.rec(L.play_voice, 0)
-
-  softcut.play(L.write_voice, 1)
+  
+  softcut.play(L.write_voice, 0)
   softcut.rec(L.write_voice, 1)
   softcut.rec_level(L.write_voice, 1.0)
   softcut.pre_level(L.write_voice, 0.0)
@@ -572,6 +636,14 @@ end
 
 function engine.start_overdub(L)
   if not L.has_loop then return end
+
+  -- Keep the write head aligned with what the performer is hearing.
+  -- Without this, overdub can write into a slightly offset buffer position,
+  -- causing comb/chorus/slapback artifacts over repeated passes.
+  softcut.voice_sync(L.write_voice, L.play_voice, 0)
+
+  L.write_pos = L.play_pos
+
   L.is_overdubbing = true
   softcut.play(L.play_voice, 1)
   softcut.play(L.write_voice, 1)
@@ -641,6 +713,8 @@ function engine.clear_modifiers(L)
   L.dj_filter_res = 1.0
 
   L.jump_div = 4
+  L.jump_trigger_div = 0
+  L.jump_trigger_enabled = false
   L.last_jump_step = nil
 
   -- clear crop and ring interaction, but keep the full recorded loop
@@ -660,6 +734,7 @@ function engine.clear_modifiers(L)
   softcut.loop_end(L.play_voice, L.full_loop_end)
   softcut.loop_start(L.write_voice, L.full_loop_start)
   softcut.loop_end(L.write_voice, L.full_loop_end)
+  apply_loop_fade(L)
 
   -- keep current playhead if possible, otherwise clamp to loop start
   if L.play_pos < L.full_loop_start or L.play_pos > L.full_loop_end then
@@ -722,6 +797,7 @@ function engine.clear_loop(L)
   L.loop_start = 0.0
   L.loop_end = 1.0
   L.play_pos = 0.0
+  L.write_pos = 0.0
 
   -- reset crop/ring interaction state
   L.held_ring_points = {}
@@ -762,6 +838,9 @@ end
 
 function engine.resume_playback(L)
   if L.has_loop then
+    softcut.voice_sync(L.write_voice, L.play_voice, 0)
+    L.write_pos = L.play_pos
+
     softcut.play(L.play_voice, 1)
     softcut.play(L.write_voice, 1)
     engine.apply_rate(L)
@@ -792,11 +871,6 @@ function engine.set_crop_fraction(L, frac)
   local min_frac = defs.MIN_LEN / full_len
   frac = util.clamp(frac, min_frac, 1.0)
 
-  if L.motion_recording then
-    L.motion_recorded_crop_len = frac * full_len
-    return
-  end
-
   L.crop_len = frac * full_len
   engine.apply_crop_state(L)
 
@@ -811,27 +885,13 @@ end
 function engine.move_crop(L, delta_frac)
   local full_len = engine.get_full_len(L)
 
-  if L.motion_recording then
-    local crop_start = L.motion_recorded_crop_start or L.crop_start
-    local crop_len = math.max(L.motion_recorded_crop_len or engine.get_crop_len(L), defs.MIN_LEN)
-
-    -- full crop normally scrubs playhead; do not do that during motion recording
-    if math.abs(crop_len - full_len) < 0.0001 then
-      return
-    end
-
-    local rel = ((crop_start - L.full_loop_start) / full_len + delta_frac) % 1.0
-    L.motion_recorded_crop_start = L.full_loop_start + rel * full_len
-    return
-  end
-
   local crop_len = engine.get_crop_len(L)
 
   -- full crop = scrub as before
   if math.abs(crop_len - full_len) < 0.0001 then
     local p = util.clamp(
       (L.play_pos - L.full_loop_start) / full_len,
-      0.0, 1.0
+      0.0, 0.999999
     )
     p = (p + delta_frac) % 1.0
     local new_pos = L.full_loop_start + p * full_len
@@ -870,6 +930,7 @@ function engine.apply_crop_state(L)
     softcut.loop_end(L.play_voice, full_end)
     softcut.loop_start(L.write_voice, full_start)
     softcut.loop_end(L.write_voice, full_end)
+    apply_loop_fade(L)
 
     engine.update_phase_quant(L)
     return
@@ -893,6 +954,7 @@ function engine.apply_crop_state(L)
     softcut.loop_end(L.play_voice, L.loop_end)
     softcut.loop_start(L.write_voice, L.loop_start)
     softcut.loop_end(L.write_voice, L.loop_end)
+    apply_loop_fade(L)
     engine.update_phase_quant(L)
   else
     -- wrapping crop: keep softcut on full loop, enforce wrap manually
@@ -903,6 +965,7 @@ function engine.apply_crop_state(L)
     softcut.loop_end(L.play_voice, full_end)
     softcut.loop_start(L.write_voice, full_start)
     softcut.loop_end(L.write_voice, full_end)
+    apply_loop_fade(L)
     engine.update_phase_quant(L)
   end
 end
@@ -910,12 +973,6 @@ end
 function engine.clear_crop(L)
   L.crop_ring_start_idx = nil
   L.crop_ring_end_idx = nil
-
-  if L.motion_recording then
-    L.motion_recorded_crop_start = L.full_loop_start
-    L.motion_recorded_crop_len = L.full_loop_end - L.full_loop_start
-    return
-  end
 
   L.crop_start = L.full_loop_start
   L.crop_len = L.full_loop_end - L.full_loop_start
@@ -1007,12 +1064,6 @@ function engine.cut_loop_between_ring_points(L, idx1, idx2)
     new_end = math.min(new_start + defs.MIN_LEN, L.full_loop_end)
   end
 
-  if L.motion_recording then
-    L.motion_recorded_crop_start = new_start
-    L.motion_recorded_crop_len = new_end - new_start
-    return
-  end
-
   L.crop_start = new_start
   L.crop_len = new_end - new_start
   L.crop_wraps = false
@@ -1031,171 +1082,355 @@ end
 -- MOTION RECORDING
 -- -------------------------------------------------------------------------
 
-function engine.get_phase_step(L)
-  local len = math.max(L.loop_end - L.loop_start, 0.0001)
-  local p = (L.play_pos - L.loop_start) / len
-  p = util.clamp(p, 0.0, 0.999999)
-  return math.floor(p * defs.PHASE_STEPS) + 1
-end
+-- Motion is a per-looper event sequencer.
+-- It is intentionally NOT tied to the audio playhead phase: crop, reverse,
+-- speed changes, and jumps should not bend the automation timeline itself.
+-- It also records only explicit user gestures. Engine setters do not
+-- automatically stamp events, because motion playback calls those same setters.
 
-function engine.capture_motion_step(L, step)
-  local full_len = math.max(L.full_loop_end - L.full_loop_start, 0.0001)
+local MOTION_STEPS = 512
 
-  local recorded_rate = L.motion_recording and (L.motion_recorded_rate or L.rate) or L.rate
-  local recorded_is_reversed = L.motion_recording and
-    ((L.motion_recorded_is_reversed ~= nil) and L.motion_recorded_is_reversed or L.is_reversed) or L.is_reversed
+local MOTION_REPLACE_BY_KIND = {
+  drywet = true,
+  overdub = true,
+  tape_age = true,
+  dropper_amt = true,
+  rate = true,
+  rate_slew = true,
+  dj_filter_freq = true,
+  dj_filter_res = true,
+  crop_set = true,
+  crop_clear = true,
+  loc = true,
+  jump_div = true,
+  jump_trigger_div = true,
+  additive_mode = true,
+}
 
-  local recorded_crop_start = L.motion_recording and (L.motion_recorded_crop_start or L.crop_start) or L.crop_start
-  local recorded_crop_len = L.motion_recording and (L.motion_recorded_crop_len or L.crop_len) or L.crop_len
-
-  local recorded_jump_div = L.motion_recording and (L.motion_recorded_jump_div or L.jump_div) or L.jump_div
-  local recorded_jump_trigger_div = L.motion_recording and
-    ((L.motion_recorded_jump_trigger_div ~= nil) and L.motion_recorded_jump_trigger_div or (L.jump_trigger_div or 0)) or
-    (L.jump_trigger_div or 0)
-
-  local crop_start_frac = util.clamp((recorded_crop_start - L.full_loop_start) / full_len, 0.0, 1.0)
-  local crop_len_frac = util.clamp(recorded_crop_len / full_len, 0.0, 1.0)
-
-  L.motion_data[step] = {
-    drywet = L.drywet,
-    overdub = L.overdub,
-    tape_age = L.tape_age,
-    dropper_amt = L.dropper_amt,
-
-    rate = recorded_rate,
-    rate_slew_mode = L.rate_slew_mode or 0,
-    is_reversed = recorded_is_reversed,
-
-    dj_filter_freq = L.dj_filter_freq,
-    dj_filter_res = L.dj_filter_res,
-
-    crop_start_frac = crop_start_frac,
-    crop_len_frac = crop_len_frac,
-
-    jump_div = recorded_jump_div,
-    jump_trigger_div = recorded_jump_trigger_div,
-    additive_mode = L.additive_mode,
-  }
-end
-
-local function motion_prev_step_idx(step)
-  if step <= 1 then
-    return defs.PHASE_STEPS
-  else
-    return step - 1
+local function motion_baseline_kind(kind)
+  if kind == "crop_set" or kind == "crop_clear" then
+    return "crop"
   end
+  return kind
 end
 
-local function motion_next_step_idx(step)
-  if step >= defs.PHASE_STEPS then
-    return 1
-  else
-    return step + 1
-  end
-end
+local function capture_motion_initial_event(L, kind)
+  local baseline_kind = motion_baseline_kind(kind)
+  if L.motion_initial_state[baseline_kind] ~= nil then return end
 
-local function motion_find_prev_recorded_step(L, step)
-  local s = motion_prev_step_idx(step)
-  while s ~= step do
-    if L.motion_data[s] ~= nil then
-      return s
+  -- Important: reset targets must come from the state at the moment motion
+  -- recording started, not from the state after the first gesture has already
+  -- changed the parameter. Otherwise, e.g. a stepped-speed move 1x -> 1.5x -> 2x
+  -- would incorrectly reset to 1.5x instead of the true starting value.
+  if L.motion_start_state ~= nil and L.motion_start_state[baseline_kind] ~= nil then
+    local e = L.motion_start_state[baseline_kind]
+    local out = {}
+    for k, v in pairs(e) do
+      out[k] = v
     end
-    s = motion_prev_step_idx(s)
-  end
-  return nil
-end
-
-local function motion_eq(a, b)
-  return math.abs((a or 0) - (b or 0)) < 0.0001
-end
-
-function engine.apply_motion_step(L, step)
-  local s = L.motion_data[step]
-  if s == nil then return end
-
-  local prev_idx = motion_find_prev_recorded_step(L, step)
-  local prev = prev_idx and L.motion_data[prev_idx] or nil
-
-  -- first recorded step: force everything once
-  if prev == nil then
-    engine.set_drywet(L, s.drywet)
-    engine.set_overdub(L, s.overdub)
-    engine.set_tape_age(L, s.tape_age)
-    engine.set_dropper_amt(L, s.dropper_amt)
-
-    L.rate = s.rate
-    L.rate_slew_mode = s.rate_slew_mode or 0
-    L.is_reversed = s.is_reversed
-    engine.apply_rate(L)
-    engine.apply_rate_slew(L)
-
-    engine.set_dj_filter_freq(L, s.dj_filter_freq)
-    engine.set_dj_filter_rq(L, s.dj_filter_res)
-
-    L.jump_div = s.jump_div
-    L.jump_trigger_div = s.jump_trigger_div or 0
-    L.last_jump_step = nil
-
-    L.additive_mode = s.additive_mode
-    engine.apply_write_mode(L)
-
+    L.motion_initial_state[baseline_kind] = out
     return
   end
 
-  if not motion_eq(s.drywet, prev.drywet) then
-    engine.set_drywet(L, s.drywet)
+  if baseline_kind == "drywet" then
+    L.motion_initial_state[baseline_kind] = { kind = "drywet", value = L.drywet }
+
+  elseif baseline_kind == "overdub" then
+    L.motion_initial_state[baseline_kind] = { kind = "overdub", value = L.overdub }
+
+  elseif baseline_kind == "tape_age" then
+    L.motion_initial_state[baseline_kind] = { kind = "tape_age", value = L.tape_age }
+
+  elseif baseline_kind == "dropper_amt" then
+    L.motion_initial_state[baseline_kind] = { kind = "dropper_amt", value = L.dropper_amt }
+
+  elseif baseline_kind == "rate" then
+    L.motion_initial_state[baseline_kind] = { kind = "rate", value = L.rate }
+
+  elseif baseline_kind == "rate_slew" then
+    L.motion_initial_state[baseline_kind] = { kind = "rate_slew", value = L.rate_slew_mode }
+
+  elseif baseline_kind == "dj_filter_freq" then
+    L.motion_initial_state[baseline_kind] = { kind = "dj_filter_freq", value = L.dj_filter_freq }
+
+  elseif baseline_kind == "dj_filter_res" then
+    L.motion_initial_state[baseline_kind] = { kind = "dj_filter_res", value = L.dj_filter_res }
+
+  elseif baseline_kind == "jump_div" then
+    L.motion_initial_state[baseline_kind] = { kind = "jump_div", value = L.jump_div }
+
+  elseif baseline_kind == "jump_trigger_div" then
+    L.motion_initial_state[baseline_kind] = { kind = "jump_trigger_div", value = L.jump_trigger_div }
+
+  elseif baseline_kind == "additive_mode" then
+    L.motion_initial_state[baseline_kind] = { kind = "additive_mode", value = L.additive_mode }
+
+  elseif baseline_kind == "loc" then
+    local full_len = engine.get_full_len(L)
+    L.motion_initial_state[baseline_kind] = {
+      kind = "loc",
+      pos_frac = util.clamp((L.play_pos - L.full_loop_start) / full_len, 0.0, 0.999999),
+    }
+
+  elseif baseline_kind == "crop" then
+    local full_len = engine.get_full_len(L)
+    local crop_len = engine.get_crop_len(L)
+    if crop_len >= full_len - 0.0001 then
+      L.motion_initial_state[baseline_kind] = { kind = "crop_clear" }
+    else
+      L.motion_initial_state[baseline_kind] = {
+        kind = "crop_set",
+        start_frac = util.clamp((L.crop_start - L.full_loop_start) / full_len, 0.0, 1.0),
+        len_frac = util.clamp(crop_len / full_len, defs.MIN_LEN / full_len, 1.0),
+      }
+    end
+  end
+end
+
+local function restore_motion_initial_state(L)
+  if L.motion_initial_state == nil then return end
+
+  -- Restore only the parameter families that were explicitly automated.
+  -- This makes each automation lane cycle start from the same parameter state
+  -- without reapplying a heavy full-looper snapshot.
+  local order = {
+    "drywet", "overdub", "tape_age", "dropper_amt",
+    "rate_slew", "rate", "dj_filter_freq", "dj_filter_res",
+    "jump_div", "jump_trigger_div", "additive_mode", "crop", "loc",
+  }
+
+  for _, kind in ipairs(order) do
+    local e = L.motion_initial_state[kind]
+    if e ~= nil then
+      engine.apply_motion_event(L, e)
+    end
   end
 
-  if not motion_eq(s.overdub, prev.overdub) then
-    engine.set_overdub(L, s.overdub)
+  -- If the performer clears/stops an automation while overdubbing, keep the
+  -- write head aligned with the audible play head. This avoids stale write-head
+  -- offsets from a previous cropped/reversed/speed-modulated motion pass.
+  if L.has_loop then
+    softcut.voice_sync(L.write_voice, L.play_voice, 0)
+    L.write_pos = L.play_pos
+  end
+end
+
+local function motion_tick_after(tick)
+  if tick >= MOTION_STEPS then
+    return 1
+  end
+  return tick + 1
+end
+
+local function motion_tick_from_time(L, now)
+  local duration = math.max(L.motion_duration or engine.get_full_len(L), 0.0001)
+  local start_time = L.motion_time_start or now
+  local elapsed = now - start_time
+  local phase = (elapsed / duration) % 1.0
+  local tick = math.floor(phase * MOTION_STEPS) + 1
+  return tick, elapsed
+end
+
+local function append_motion_event_at_tick(L, tick, event)
+  if event == nil or event.kind == nil then return end
+
+  if L.motion_data[tick] == nil then
+    L.motion_data[tick] = {}
   end
 
-  if not motion_eq(s.tape_age, prev.tape_age) then
-    engine.set_tape_age(L, s.tape_age)
+  -- Continuous gestures can produce multiple values inside one tick.
+  -- Keep the last value for that parameter, but preserve ordering for
+  -- genuinely different event kinds.
+  if MOTION_REPLACE_BY_KIND[event.kind] then
+    for i = #L.motion_data[tick], 1, -1 do
+      if L.motion_data[tick][i].kind == event.kind then
+        L.motion_data[tick][i] = event
+        return
+      end
+    end
   end
 
-  if not motion_eq(s.dropper_amt, prev.dropper_amt) then
-    engine.set_dropper_amt(L, s.dropper_amt)
+  table.insert(L.motion_data[tick], event)
+end
+
+local function copy_motion_event(e)
+  if e == nil then return nil end
+  local out = {}
+  for k, v in pairs(e) do
+    out[k] = v
+  end
+  return out
+end
+
+local function capture_motion_start_state(L)
+  local full_len = engine.get_full_len(L)
+  local crop_len = engine.get_crop_len(L)
+  local crop_event
+
+  if crop_len >= full_len - 0.0001 then
+    crop_event = { kind = "crop_clear" }
+  else
+    crop_event = {
+      kind = "crop_set",
+      start_frac = util.clamp((L.crop_start - L.full_loop_start) / full_len, 0.0, 1.0),
+      len_frac = util.clamp(crop_len / full_len, defs.MIN_LEN / full_len, 1.0),
+    }
   end
 
-  if not motion_eq(s.rate, prev.rate) then
-    L.rate = s.rate
+  return {
+    drywet = { kind = "drywet", value = L.drywet },
+    overdub = { kind = "overdub", value = L.overdub },
+    tape_age = { kind = "tape_age", value = L.tape_age },
+    dropper_amt = { kind = "dropper_amt", value = L.dropper_amt },
+    rate = { kind = "rate", value = L.rate },
+    rate_slew = { kind = "rate_slew", value = L.rate_slew_mode },
+    dj_filter_freq = { kind = "dj_filter_freq", value = L.dj_filter_freq },
+    dj_filter_res = { kind = "dj_filter_res", value = L.dj_filter_res },
+    jump_div = { kind = "jump_div", value = L.jump_div },
+    jump_trigger_div = { kind = "jump_trigger_div", value = L.jump_trigger_div },
+    additive_mode = { kind = "additive_mode", value = L.additive_mode },
+    crop = crop_event,
+    loc = {
+      kind = "loc",
+      pos_frac = util.clamp((L.play_pos - L.full_loop_start) / full_len, 0.0, 0.999999),
+    },
+  }
+end
+
+local function append_motion_reset_events(L)
+  if L.motion_initial_state == nil then return end
+
+  -- At the end of the automation lane, explicitly return only the parameter
+  -- families that were touched during recording to their pre-motion values.
+  -- This keeps the lane repeatable without restoring a heavy full-looper state.
+  local order = {
+    "drywet", "overdub", "tape_age", "dropper_amt",
+    "rate_slew", "rate", "dj_filter_freq", "dj_filter_res",
+    "jump_div", "jump_trigger_div", "additive_mode", "crop", "loc",
+  }
+
+  for _, kind in ipairs(order) do
+    local e = copy_motion_event(L.motion_initial_state[kind])
+    if e ~= nil then
+      if L.motion_data[MOTION_STEPS] == nil then
+        L.motion_data[MOTION_STEPS] = {}
+      end
+      -- Do not coalesce here: if the performer deliberately recorded an event
+      -- very near the end, the reset should still happen after it.
+      table.insert(L.motion_data[MOTION_STEPS], e)
+    end
+  end
+end
+
+function engine.record_motion_event(L, event)
+  if not L.motion_recording then return end
+  if event == nil or event.kind == nil then return end
+
+  capture_motion_initial_event(L, event.kind)
+
+  local tick = motion_tick_from_time(L, util.time())
+  append_motion_event_at_tick(L, tick, event)
+end
+
+function engine.record_crop_motion_event(L)
+  if not L.motion_recording then return end
+
+  local full_len = engine.get_full_len(L)
+  local crop_len = engine.get_crop_len(L)
+
+  if crop_len >= full_len - 0.0001 then
+    engine.record_motion_event(L, { kind = "crop_clear" })
+    return
+  end
+
+  engine.record_motion_event(L, {
+    kind = "crop_set",
+    start_frac = util.clamp((L.crop_start - L.full_loop_start) / full_len, 0.0, 1.0),
+    len_frac = util.clamp(crop_len / full_len, defs.MIN_LEN / full_len, 1.0),
+  })
+end
+
+function engine.record_playhead_motion_event(L)
+  if not L.motion_recording then return end
+
+  local full_len = engine.get_full_len(L)
+  engine.record_motion_event(L, {
+    kind = "loc",
+    pos_frac = util.clamp((L.play_pos - L.full_loop_start) / full_len, 0.0, 0.999999),
+  })
+end
+
+function engine.apply_motion_event(L, e)
+  if e == nil or e.kind == nil then return end
+
+  if e.kind == "drywet" then
+    engine.set_drywet(L, e.value)
+
+  elseif e.kind == "overdub" then
+    engine.set_overdub(L, e.value)
+
+  elseif e.kind == "tape_age" then
+    engine.set_tape_age(L, e.value)
     engine.apply_rate(L)
-  end
 
-  if (s.rate_slew_mode or 0) ~= (prev.rate_slew_mode or 0) then
-    L.rate_slew_mode = s.rate_slew_mode or 0
+  elseif e.kind == "dropper_amt" then
+    engine.set_dropper_amt(L, e.value)
+
+  elseif e.kind == "rate" then
+    L.rate = util.clamp(e.value or L.rate or 1.0, -4.0, 4.0)
+    if math.abs(L.rate) < 0.001 then L.rate = 0 end
+    L.is_reversed = (L.rate < 0)
+    engine.apply_rate(L)
+
+  elseif e.kind == "rate_slew" then
+    L.rate_slew_mode = e.value or 0
     engine.apply_rate_slew(L)
-  end
 
-  if s.is_reversed ~= prev.is_reversed then
-    L.is_reversed = not L.is_reversed
-    engine.apply_rate(L)
-  end
+  elseif e.kind == "dj_filter_freq" then
+    engine.set_dj_filter_freq(L, e.value)
 
-  if not motion_eq(s.dj_filter_freq, prev.dj_filter_freq) then
-    engine.set_dj_filter_freq(L, s.dj_filter_freq)
-  end
+  elseif e.kind == "dj_filter_res" then
+    engine.set_dj_filter_rq(L, e.value)
 
-  if not motion_eq(s.dj_filter_res, prev.dj_filter_res) then
-    engine.set_dj_filter_rq(L, s.dj_filter_res)
-  end
+  elseif e.kind == "crop_set" then
+    local full_len = engine.get_full_len(L)
+    L.crop_start = L.full_loop_start + util.clamp(e.start_frac or 0.0, 0.0, 1.0) * full_len
+    L.crop_len = util.clamp((e.len_frac or 1.0) * full_len, defs.MIN_LEN, full_len)
+    engine.apply_crop_state(L)
 
-  if s.jump_div ~= prev.jump_div then
-    L.jump_div = s.jump_div
+  elseif e.kind == "crop_clear" then
+    L.crop_start = L.full_loop_start
+    L.crop_len = L.full_loop_end - L.full_loop_start
+    L.crop_wraps = false
+    engine.apply_crop_state(L)
+
+  elseif e.kind == "loc" then
+    local full_len = engine.get_full_len(L)
+    local frac = util.clamp(e.pos_frac or 0.0, 0.0, 0.999999)
+    engine.set_loop_position(L, L.full_loop_start + frac * full_len)
+
+  elseif e.kind == "jump_div" then
+    L.jump_div = e.value or 0
     L.last_jump_step = nil
-  end
 
-  if (s.jump_trigger_div or 0) ~= (prev.jump_trigger_div or 0) then
-    L.jump_trigger_div = s.jump_trigger_div or 0
+  elseif e.kind == "jump_trigger_div" then
+    L.jump_trigger_div = e.value or 0
+    L.jump_trigger_enabled = (L.jump_trigger_div ~= 0)
     L.last_jump_step = nil
-  end
 
-  if s.additive_mode ~= prev.additive_mode then
-    L.additive_mode = s.additive_mode
+  elseif e.kind == "additive_mode" then
+    L.additive_mode = e.value and true or false
     engine.apply_write_mode(L)
   end
+end
 
+function engine.apply_motion_tick(L, tick)
+  local events = L.motion_data[tick]
+  if events == nil then return end
+
+  for _, e in ipairs(events) do
+    engine.apply_motion_event(L, e)
+  end
 end
 
 function engine.start_motion_recording(L)
@@ -1205,20 +1440,12 @@ function engine.start_motion_recording(L)
   L.motion_playback = false
   L.motion_recording = true
   L.motion_data = {}
-  L.motion_last_step = nil
-  L.motion_record_start_step = engine.get_phase_step(L)
-
-  L.motion_record_direction_reversed = L.is_reversed
-
-  L.motion_recorded_rate = L.rate
-  L.motion_recorded_is_reversed = L.is_reversed
-  L.motion_recorded_crop_start = L.crop_start
-  L.motion_recorded_crop_len = L.crop_len
-  L.motion_recorded_jump_div = L.jump_div
-  L.motion_recorded_jump_trigger_div = L.jump_trigger_div or 0
-
-  engine.capture_motion_step(L, L.motion_record_start_step)
-  L.motion_last_step = L.motion_record_start_step
+  L.motion_initial_state = {}
+  L.motion_start_state = capture_motion_start_state(L)
+  L.motion_duration = engine.get_full_len(L)
+  L.motion_time_start = util.time()
+  L.motion_last_tick = nil
+  L.motion_advancing = false
 end
 
 function engine.stop_motion_recording(L)
@@ -1226,34 +1453,39 @@ function engine.stop_motion_recording(L)
 
   L.motion_recording = false
   L.motion_has_data = next(L.motion_data) ~= nil
-  L.motion_playback = L.motion_has_data
-  L.motion_last_step = nil
-  L.motion_record_start_step = nil
 
-  L.motion_record_direction_reversed = nil
-  L.motion_recorded_rate = nil
-  L.motion_recorded_is_reversed = nil
-  L.motion_recorded_crop_start = nil
-  L.motion_recorded_crop_len = nil
-  L.motion_recorded_jump_div = nil
-  L.motion_recorded_jump_trigger_div = nil
+  if L.motion_has_data then
+    append_motion_reset_events(L)
+    restore_motion_initial_state(L)
+  end
+
+  L.motion_playback = L.motion_has_data
+  L.motion_time_start = util.time()
+  L.motion_last_tick = MOTION_STEPS
+  L.motion_advancing = false
 end
 
 function engine.clear_motion(L)
-  L.motion_has_data = false
+  local should_restore = L.motion_has_data or L.motion_playback or L.motion_recording
+
   L.motion_playback = false
   L.motion_recording = false
-  L.motion_data = {}
-  L.motion_last_step = nil
-  L.motion_record_start_step = nil
+  L.motion_advancing = false
 
-  L.motion_record_direction_reversed = nil
-  L.motion_recorded_rate = nil
-  L.motion_recorded_is_reversed = nil
-  L.motion_recorded_crop_start = nil
-  L.motion_recorded_crop_len = nil
-  L.motion_recorded_jump_div = nil
-  L.motion_recorded_jump_trigger_div = nil
+  if should_restore then
+    restore_motion_initial_state(L)
+  elseif L.has_loop then
+    softcut.voice_sync(L.write_voice, L.play_voice, 0)
+    L.write_pos = L.play_pos
+  end
+
+  L.motion_has_data = false
+  L.motion_data = {}
+  L.motion_initial_state = {}
+  L.motion_start_state = {}
+  L.motion_time_start = nil
+  L.motion_duration = nil
+  L.motion_last_tick = nil
 end
 
 function engine.motion_key_press(L)
@@ -1264,42 +1496,55 @@ function engine.motion_key_press(L)
   end
 end
 
+function engine.restart_motion_playback(L)
+  if not L.motion_has_data then return end
+  restore_motion_initial_state(L)
+  L.motion_playback = true
+  L.motion_time_start = util.time()
+  L.motion_last_tick = MOTION_STEPS
+  L.motion_advancing = false
+end
+
+function engine.advance_motion_state(L)
+  if L.motion_advancing then return end
+
+  if L.motion_recording then
+    local _, elapsed = motion_tick_from_time(L, util.time())
+    if elapsed >= (L.motion_duration or engine.get_full_len(L)) then
+      engine.stop_motion_recording(L)
+    end
+    return
+  end
+
+  if not (L.motion_playback and L.motion_has_data) then
+    return
+  end
+
+  local tick = motion_tick_from_time(L, util.time())
+  if tick == L.motion_last_tick then return end
+
+  L.motion_advancing = true
+
+  local last = L.motion_last_tick or MOTION_STEPS
+  local t = motion_tick_after(last)
+  while true do
+    engine.apply_motion_tick(L, t)
+    if t == tick then break end
+    t = motion_tick_after(t)
+  end
+
+  L.motion_last_tick = tick
+  L.motion_advancing = false
+end
+
 function engine.phase_cb(loopers, i, pos)
   for _, L in ipairs(loopers) do
     if i == L.play_voice then
-      L.play_pos = pos
-
-      local step = engine.get_phase_step(L)
-
-      if L.motion_recording then
-        if step ~= L.motion_last_step then
-          local step_fn = L.motion_record_direction_reversed and motion_prev_step_idx or motion_next_step_idx
-          local s = step_fn(L.motion_last_step or step)
-
-          while true do
-            engine.capture_motion_step(L, s)
-
-            if s == step then
-              break
-            end
-
-            s = step_fn(s)
-          end
-
-          if L.motion_record_start_step ~= nil and step == L.motion_record_start_step then
-            engine.stop_motion_recording(L)
-          else
-            L.motion_last_step = step
-          end
-        end
-
-      elseif L.motion_playback and L.motion_has_data then
-        if step ~= L.motion_last_step then
-          engine.apply_motion_step(L, step)
-          L.motion_last_step = step
-        end
+      if L.scrub_continue then
+        return
       end
 
+      L.play_pos = pos
       return
     end
   end
@@ -1344,21 +1589,11 @@ end
 -- -------------------------------------------------------------------------
 
 function engine.set_jump_div(L, div)
-  if L.motion_recording then
-    L.motion_recorded_jump_div = div or 0
-    return
-  end
-
   L.jump_div = div or 0
   L.last_jump_step = nil
 end
 
 function engine.set_jump_trigger_div(L, div)
-  if L.motion_recording then
-    L.motion_recorded_jump_trigger_div = div or 0
-    return
-  end
-
   L.jump_trigger_div = div or 0
   L.jump_trigger_enabled = (L.jump_trigger_div ~= 0)
   L.last_jump_step = nil

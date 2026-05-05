@@ -3,7 +3,7 @@
 -- two entertwined loopers
 --
 --    make them evolve 
---    make the collide.
+--    and collide.
 -- 
 -- version: 0.1.0
 --
@@ -68,6 +68,16 @@ local KEY_INFO_DELAY = 0.5
 local trigger_snapshot_flash
 local refresh_routing
 local restore_performance_state
+
+local scrub_friction = 0.8
+local ARC_SCRUB_SCALE = 0.5 / (64 * 4)
+
+-- forward function defs
+local start_record_now
+local stop_record_now
+local stop_scrub_motion
+local sync_linked_playheads
+
 
 -- -------------------------------------------------------------------------
 -- CLOCKING
@@ -183,13 +193,13 @@ local function start_clock_tick_task()
   end)
 end
 
-local function start_record_now(L)
+start_record_now = function(L)
   looper_engine.start_recording(L)
   L.clock_record_ticks = 0
   L.clock_play_ticks = 0
 end
 
-local function stop_record_now(L)
+stop_record_now = function(L)
   if clock_mode == CLOCK_MODE_N_BARS then
     L.clock_loop_ticks = clock_n_bars * clock_bar_beats
   else
@@ -624,6 +634,7 @@ end
 local function reset_all()
   for _, L in ipairs(loopers) do
     looper_engine.reset_looper(L)
+    stop_scrub_motion(L)
     L.selected = false
   end
 
@@ -646,6 +657,7 @@ end
 
 local function clear_modifiers_all()
   for _, L in ipairs(loopers) do
+    stop_scrub_motion(L)
     looper_engine.clear_modifiers(L)
   end
 
@@ -660,6 +672,30 @@ local function clear_modifiers_all()
 end
 
 -- -------------------------------------------------------------------------
+-- MOTION EVENT HELPERS
+-- -------------------------------------------------------------------------
+
+local function record_motion_value(L, kind, value)
+  looper_engine.record_motion_event(L, { kind = kind, value = value })
+end
+
+local function crop_is_active(L)
+  local full_len = math.max(L.full_loop_end - L.full_loop_start, 0.0001)
+  local crop_len = looper_engine.get_crop_len(L)
+  return crop_len < full_len - 0.0001
+end
+
+local function record_crop_motion(L)
+  looper_engine.record_crop_motion_event(L)
+end
+
+local function record_crop_motion_if_active(L)
+  if crop_is_active(L) then
+    looper_engine.record_crop_motion_event(L)
+  end
+end
+
+-- -------------------------------------------------------------------------
 -- PARAMETER ADJUSTMENTS
 -- -------------------------------------------------------------------------
 
@@ -668,17 +704,23 @@ local function stepped_speed_targets()
 end
 
 local function motion_or_live_rate(L)
-  if L.motion_recording and L.motion_recorded_rate ~= nil then
-    return L.motion_recorded_rate
-  end
   return L.rate
 end
 
 local function motion_or_live_is_reversed(L)
-  if L.motion_recording and L.motion_recorded_is_reversed ~= nil then
-    return L.motion_recorded_is_reversed
-  end
   return L.is_reversed
+end
+
+local function maybe_resync_playhead_on_normal_speed(L, signed_rate)
+  if not L.has_loop then return end
+  if L.is_recording then return end
+
+  -- When using pitch-delay tricks, the play head and write head drift apart.
+  -- Returning to normal speed should feel like returning to a normal looper,
+  -- not like leaving a hidden slapback delay behind.
+  if math.abs(math.abs(signed_rate) - 1.0) < 0.0001 then
+    softcut.voice_sync(L.play_voice, L.write_voice, 0)
+  end
 end
 
 local function set_signed_rate(L, signed_rate)
@@ -688,35 +730,27 @@ local function set_signed_rate(L, signed_rate)
     signed_rate = 0
   end
 
-  local pending_is_reversed = (signed_rate < 0)
-
-  if L.motion_recording then
-    L.motion_recorded_rate = signed_rate
-    L.motion_recorded_is_reversed = pending_is_reversed
-
-    local live_mag = math.abs(signed_rate)
-    L.rate = L.is_reversed and -live_mag or live_mag
-    looper_engine.apply_rate(L)
-    return
-  end
-
   L.rate = signed_rate
-  L.is_reversed = pending_is_reversed
+  L.is_reversed = (signed_rate < 0)
   looper_engine.apply_rate(L)
+
+  looper_engine.record_motion_event(L, {
+    kind = "rate",
+    value = L.rate,
+  })
+
+  maybe_resync_playhead_on_normal_speed(L, signed_rate)
 end
 
 local function toggle_reverse_state(L)
-  if L.motion_recording then
-    local new_is_reversed = not motion_or_live_is_reversed(L)
-    local mag = math.abs(motion_or_live_rate(L))
-    L.motion_recorded_is_reversed = new_is_reversed
-    L.motion_recorded_rate = new_is_reversed and -mag or mag
-    return
-  end
-
   L.is_reversed = not L.is_reversed
   L.rate = L.is_reversed and -math.abs(L.rate) or math.abs(L.rate)
   looper_engine.apply_rate(L)
+
+  looper_engine.record_motion_event(L, {
+    kind = "rate",
+    value = L.rate,
+  })
 end
 
 local function apply_free_speed(L, d)
@@ -751,15 +785,111 @@ local function apply_stepped_speed(L, d)
   set_signed_rate(L, sign * targets[best_i])
 end
 
+stop_scrub_motion = function(L)
+  L.scrub_continue = false
+  L.scrub_velocity = 0.0
+  L.scrub_last_arc_time = nil
+  L.scrub_last_arc_n = nil
+  L.scrub_pos = nil
+  L.scrub_return_to_natural = false
+end
+
+local function update_scrub_velocity(L, arc_n, d)
+  local now = util.time()
+  local delta_frac = d * ARC_SCRUB_SCALE
+
+  if L.scrub_pos == nil then
+    L.scrub_pos = L.play_pos
+  end
+
+  if L.scrub_last_arc_time ~= nil and L.scrub_last_arc_n == arc_n then
+    local dt = now - L.scrub_last_arc_time
+    dt = util.clamp(dt, 0.005, 0.2)
+    L.scrub_velocity = 0.99 * (L.scrub_velocity or 0.0) + 0.01 * (delta_frac / dt)
+  end
+
+  L.scrub_last_arc_time = now
+  L.scrub_last_arc_n = arc_n
+  L.scrub_continue = true
+  L.scrub_return_to_natural = mod_shift_held
+end
+
+local function throw_scrub_motion(L, d, delta_frac, use_friction)
+  local now = util.time()
+  local dt = nil
+
+  if L.scrub_last_arc_time ~= nil then
+    dt = now - L.scrub_last_arc_time
+    dt = util.clamp(dt, 0.01, 0.2)
+  end
+
+  L.scrub_last_arc_time = now
+
+  local vel
+  if dt ~= nil and dt > 0 then
+    vel = delta_frac / dt
+  else
+    -- fallback for first tick
+    vel = delta_frac / 0.03
+  end
+
+  L.scrub_velocity = vel
+  L.scrub_friction = use_friction and scrub_friction or 0.0
+end
+
+local function advance_scrub_motion(L, dt)
+  if not L.scrub_continue then
+    return
+  end
+
+  local v = L.scrub_velocity or 0.0
+
+  if L.scrub_return_to_natural then
+    local f = scrub_friction or 0.0
+    if f > 0 then
+      local sign = (v >= 0) and 1 or -1
+      local mag = math.abs(v) - f * dt
+      if mag <= 0.000001 then
+        L.scrub_velocity = 0.0
+        L.scrub_continue = false
+        L.scrub_pos = nil
+        return
+      else
+        v = sign * mag
+        L.scrub_velocity = v
+      end
+    end
+  end
+
+  if math.abs(v) < 0.000001 then
+    return
+  end
+
+  local full_len = L.full_loop_end - L.full_loop_start
+  local crop_len = looper_engine.get_crop_len(L)
+
+  if math.abs(crop_len - full_len) < 0.0001 then
+    local source_pos = L.scrub_pos or L.play_pos
+    local new_pos = looper_engine.move_playhead_full_loop_from_pos(L, source_pos, v * dt)
+    L.scrub_pos = new_pos
+  else
+    looper_engine.move_crop(L, v * dt)
+    L.scrub_pos = nil
+  end
+
+end
+
 local function adjust_selected_drywet(d)
   looper_engine.for_each_selected(loopers, function(L)
     looper_engine.set_drywet(L, L.drywet + d * 0.01)
+    record_motion_value(L, "drywet", L.drywet)
   end)
 end
 
 local function adjust_selected_overdub(d)
   looper_engine.for_each_selected(loopers, function(L)
     looper_engine.set_overdub(L, L.overdub + d * 0.04)
+    record_motion_value(L, "overdub", L.overdub)
   end)
   refresh_routing()
 end
@@ -768,18 +898,21 @@ local function adjust_selected_tape(d)
   looper_engine.for_each_selected(loopers, function(L)
     looper_engine.set_tape_age(L, L.tape_age + d * 0.04)
     looper_engine.apply_rate(L)
+    record_motion_value(L, "tape_age", L.tape_age)
   end)
 end
 
 local function adjust_selected_dropper(d)
   looper_engine.for_each_selected(loopers, function(L)
     looper_engine.set_dropper_amt(L, L.dropper_amt + d * 0.04)
+    record_motion_value(L, "dropper_amt", L.dropper_amt)
   end)
 end
 
 local function move_playhead_for_looper(idx, d)
   local L = loopers[idx]
   looper_engine.move_crop(L, d * 2 / (64 * 4))
+  record_crop_motion_if_active(L)
   if idx == 1 and link_playheads then
     sync_linked_playheads()
   end
@@ -790,6 +923,7 @@ local function change_crop_len_for_looper(idx, d)
   local frac = looper_engine.get_crop_fraction(L)
   frac = frac + d * 0.004
   looper_engine.set_crop_fraction(L, frac)
+  record_crop_motion(L)
   if idx == 1 and link_playheads then
     sync_linked_playheads()
   end
@@ -903,6 +1037,7 @@ function key(n, z)
         k3_consumed = true
         looper_engine.for_each_selected(loopers, function(L)
           looper_engine.toggle_additive_mode(L)
+          record_motion_value(L, "additive_mode", L.additive_mode)
         end)
         refresh_routing()
         redraw()
@@ -915,6 +1050,7 @@ function key(n, z)
 
       if not suppress_tap then
         looper_engine.for_each_selected(loopers, function(L)
+          stop_scrub_motion(L)
           looper_engine.clear_loop(L)
         end)
         refresh_routing()
@@ -989,13 +1125,16 @@ local function handle_ring_key(L, ring_idx, z)
     if n == 2 then
       L.ring_crop_happened = true
       looper_engine.update_ring_loop_cut(L)
+      record_crop_motion(L)
     end
   else
     local n_before_release = looper_engine.count_held_ring_points(L)
 
     if n_before_release == 1 and L.held_ring_points[ring_idx] and not L.ring_crop_happened then
       looper_engine.clear_crop(L)
+      record_crop_motion(L)
       looper_engine.set_playhead_from_ring_idx(L, ring_idx)
+      looper_engine.record_playhead_motion_event(L)
     end
 
     L.held_ring_points[ring_idx] = nil
@@ -1006,7 +1145,7 @@ local function handle_ring_key(L, ring_idx, z)
   end
 end
 
-local function sync_linked_playheads()
+sync_linked_playheads = function()
   if not link_playheads then return end
   if #loopers < 2 then return end
 
@@ -1039,6 +1178,7 @@ local function grid_key(x, y, z)
     if val ~= nil then
       looper_engine.for_each_selected(loopers, function(LL)
         looper_engine.set_drywet(LL, val)
+        record_motion_value(LL, "drywet", LL.drywet)
       end)
       redraw_all()
     end
@@ -1050,6 +1190,7 @@ local function grid_key(x, y, z)
     if val ~= nil then
       looper_engine.for_each_selected(loopers, function(LL)
         looper_engine.set_overdub(LL, val)
+        record_motion_value(LL, "overdub", LL.overdub)
       end)
       refresh_routing()
       redraw_all()
@@ -1063,6 +1204,7 @@ local function grid_key(x, y, z)
       looper_engine.for_each_selected(loopers, function(LL)
         looper_engine.set_tape_age(LL, val)
         looper_engine.apply_rate(LL)
+        record_motion_value(LL, "tape_age", LL.tape_age)
       end)
       redraw_all()
     end
@@ -1074,6 +1216,7 @@ local function grid_key(x, y, z)
     if val ~= nil then
       looper_engine.for_each_selected(loopers, function(LL)
         looper_engine.set_dj_filter_freq(LL, val)
+        record_motion_value(LL, "dj_filter_freq", LL.dj_filter_freq)
       end)
       redraw_all()
     end
@@ -1097,6 +1240,7 @@ local function grid_key(x, y, z)
     if val ~= nil then
       looper_engine.for_each_selected(loopers, function(LL)
         looper_engine.set_dropper_amt(LL, val)
+        record_motion_value(LL, "dropper_amt", LL.dropper_amt)
       end)
       redraw_all()
     end
@@ -1113,6 +1257,7 @@ local function grid_key(x, y, z)
     if target_val ~= nil then
       looper_engine.for_each_selected(loopers, function(LL)
         looper_engine.set_jump_div(LL, target_val)
+        record_motion_value(LL, "jump_div", LL.jump_div)
       end)
       redraw_all()
       return
@@ -1134,9 +1279,11 @@ local function grid_key(x, y, z)
         if is_same_as_current then
           LL.jump_trigger_enabled = false
           looper_engine.set_jump_trigger_div(LL, 0)
+          record_motion_value(LL, "jump_trigger_div", LL.jump_trigger_div)
         else
           LL.jump_trigger_enabled = true
           looper_engine.set_jump_trigger_div(LL, trigger_val)
+          record_motion_value(LL, "jump_trigger_div", LL.jump_trigger_div)
         end
       end)
       redraw_all()
@@ -1216,7 +1363,7 @@ local function grid_key(x, y, z)
       if L.motion_has_data then
         L.motion_playback = not L.motion_playback
         if L.motion_playback then
-          L.motion_last_step = nil
+          looper_engine.restart_motion_playback(L)
         end
       end
     else
@@ -1236,7 +1383,7 @@ local function grid_key(x, y, z)
       if L.motion_has_data then
         L.motion_playback = not L.motion_playback
         if L.motion_playback then
-          L.motion_last_step = nil
+          looper_engine.restart_motion_playback(L)
         end
       end
     else
@@ -1250,6 +1397,7 @@ local function grid_key(x, y, z)
   if looper_ui.grid_match_any(x, y, defs.ADDITIVE_KEY) and z == 1 then
     looper_engine.for_each_selected(loopers, function(LL)
       looper_engine.toggle_additive_mode(LL)
+      record_motion_value(LL, "additive_mode", LL.additive_mode)
     end)
     refresh_routing()
     redraw_all()
@@ -1268,6 +1416,7 @@ local function grid_key(x, y, z)
     looper_engine.for_each_selected(loopers, function(LL)
       LL.rate_slew_mode = (LL.rate_slew_mode + 1) % 3
       looper_engine.apply_rate_slew(LL)
+      record_motion_value(LL, "rate_slew", LL.rate_slew_mode)
     end)
     redraw_all()
     return
@@ -1388,7 +1537,9 @@ local function grid_key(x, y, z)
 
     if z == 1 then
       if shift_held and mod_shift_held then
-        looper_engine.for_each_selected(loopers, function(LL)
+        for _, LL in ipairs(loopers) do
+          stop_scrub_motion(LL)
+
           LL.is_recording = false
           LL.is_overdubbing = false
           LL.rec_start_time = 0
@@ -1406,15 +1557,51 @@ local function grid_key(x, y, z)
           softcut.play(LL.write_voice, 0)
 
           softcut.level_cut_cut(LL.play_voice, LL.write_voice, 0.0)
-        end)
+        end
         refresh_routing()
         redraw_all()
+
       elseif shift_held then
-        reset_all()
+        for _, LL in ipairs(loopers) do
+          looper_engine.reset_looper(LL)
+          stop_scrub_motion(LL)
+          LL.selected = false
+        end
+
+        loopers[1].selected = true
+
+        link_playheads = false
+        shift_held = false
+
+        send_1_to_2 = 0.33
+        send_2_to_1 = 0.33
+        send_1_to_2_enabled = false
+        send_2_to_1_enabled = false
+
+        snapshot_1 = nil
+        snapshot_2 = nil
+
+        refresh_routing()
+        redraw_all()
+
       elseif mod_shift_held then
-        clear_modifiers_all()
+        for _, LL in ipairs(loopers) do
+          stop_scrub_motion(LL)
+          looper_engine.clear_modifiers(LL)
+        end
+
+        link_playheads = false
+        send_1_to_2 = 0.33
+        send_2_to_1 = 0.33
+        send_1_to_2_enabled = false
+        send_2_to_1_enabled = false
+
+        refresh_routing()
+        redraw_all()
+
       else
         looper_engine.for_each_selected(loopers, function(LL)
+          stop_scrub_motion(LL)
           looper_engine.clear_loop(LL)
           looper_engine.clear_motion(LL)
         end)
@@ -1458,9 +1645,16 @@ local function arc_delta(n, d)
   if arc_page == 1 then
     if n == 1 then
       local L = loopers[1]
-      looper_engine.move_crop(L, d * 0.5 / (64 * 4))
-      if link_playheads then
-        sync_linked_playheads()
+      local delta_frac = d * ARC_SCRUB_SCALE
+    
+      looper_engine.move_crop(L, delta_frac)
+      record_crop_motion_if_active(L)
+    
+      if shift_held or mod_shift_held then
+        L.scrub_pos = L.play_pos
+        update_scrub_velocity(L, n, d)
+      else
+        stop_scrub_motion(L)
       end
 
     elseif n == 2 then
@@ -1468,19 +1662,31 @@ local function arc_delta(n, d)
       local frac = looper_engine.get_crop_fraction(L)
       frac = frac + d * 0.004
       looper_engine.set_crop_fraction(L, frac)
+      record_crop_motion(L)
       if link_playheads then
         sync_linked_playheads()
       end
 
     elseif n == 3 then
       local L = loopers[2]
-      looper_engine.move_crop(L, d * 0.5 / (64 * 4))
+      local delta_frac = d * ARC_SCRUB_SCALE
+    
+      looper_engine.move_crop(L, delta_frac)
+      record_crop_motion_if_active(L)
+    
+      if shift_held or mod_shift_held then
+        L.scrub_pos = L.play_pos
+        update_scrub_velocity(L, n, d)
+      else
+        stop_scrub_motion(L)
+      end
 
     elseif n == 4 then
       local L = loopers[2]
       local frac = looper_engine.get_crop_fraction(L)
       frac = frac + d * 0.004
       looper_engine.set_crop_fraction(L, frac)
+      record_crop_motion(L)
     end
 
   elseif arc_page == 2 then
@@ -1512,12 +1718,16 @@ local function arc_delta(n, d)
   elseif arc_page == 3 then
     if n == 1 then
       looper_engine.set_dj_filter_freq(loopers[1], loopers[1].dj_filter_freq + d * 0.001)
+      record_motion_value(loopers[1], "dj_filter_freq", loopers[1].dj_filter_freq)
     elseif n == 2 then
       looper_engine.set_dj_filter_rq(loopers[1], loopers[1].dj_filter_res - d * 0.001)
+      record_motion_value(loopers[1], "dj_filter_res", loopers[1].dj_filter_res)
     elseif n == 3 then
       looper_engine.set_dj_filter_freq(loopers[2], loopers[2].dj_filter_freq + d * 0.001)
+      record_motion_value(loopers[2], "dj_filter_freq", loopers[2].dj_filter_freq)
     elseif n == 4 then
       looper_engine.set_dj_filter_rq(loopers[2], loopers[2].dj_filter_res - d * 0.001)
+      record_motion_value(loopers[2], "dj_filter_res", loopers[2].dj_filter_res)
     end
   end
 
@@ -1530,6 +1740,7 @@ end
 
 function init()
   looper_engine.setup_softcut(loopers)
+  looper_engine.set_input_gain(loopers, 1.0)
 
   softcut.event_phase(function(i, pos)
     looper_engine.phase_cb(loopers, i, pos)
@@ -1543,8 +1754,10 @@ function init()
     for _, L in ipairs(loopers) do
       looper_engine.apply_tape_warble(L, viz_metro.time)
       looper_engine.apply_dropper(L, viz_metro.time)
+      advance_scrub_motion(L, viz_metro.time)
       looper_engine.enforce_wrapped_crop(L)
       looper_engine.apply_jump(L)
+      looper_engine.advance_motion_state(L)
     end
     sync_linked_playheads()
     
@@ -1668,6 +1881,30 @@ function init()
     clock_ignore_transport = (v == 2)
   end)
   
+  params:add_separator("bliss_input_section", "Input")
+
+  params:add_control(
+    "bliss_input_gain",
+    "input gain",
+    controlspec.new(0.0, 2.0, "lin", 0.01, 1.0, "x")
+  )
+  
+  params:add_separator("bliss_scrub_section", "Scrub inertia")
+
+  params:add_control(
+    "bliss_scrub_friction",
+    "scrub friction",
+    controlspec.new(0.0, 4.0, "lin", 0.01, 0.8, " frac/s²")
+  )
+  
+  params:set_action("bliss_scrub_friction", function(v)
+    scrub_friction = v
+  end)
+  
+  params:set_action("bliss_input_gain", function(v)
+    looper_engine.set_input_gain(loopers, v)
+  end)
+  
   update_clock_param_visibility()
 
   redraw_all()
@@ -1687,6 +1924,7 @@ function redraw()
 end
 
 function cleanup()
+  
   for _, L in ipairs(loopers) do
     softcut.rec(L.play_voice, 0)
     softcut.rec(L.write_voice, 0)

@@ -95,9 +95,9 @@ These operate on the **selected looper(s)**.
 
 - **col 1**: dry / wet
 - **col 2**: overdub amount
-- **col 3**: tape warble
-- **col 4**: filter frequency
-- **col 5**: stepped speed
+- **col 3**: filter frequency
+- **col 4**: stepped speed
+- **col 5**: tape warble
 - **col 6**: dropper amount
 - **col 7**: jump / shuffle
   - lower half = jump trigger density
@@ -135,7 +135,7 @@ Motion capture is represented by two dots (one per looper).
 
 - **16,8**: record / stop / overdub selected looper(s)
 - **16,7**: reverse
-- **16,6**: rate slew cycle (`off -> short -> long -> off`)
+- **16,6**: rate slew cycle (`short -> long -> off -> short`)
 - **16,5**: additive mode
 - **16,4**: snapshot button
 - **16,3**: mod shift

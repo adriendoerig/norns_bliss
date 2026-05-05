@@ -55,8 +55,8 @@ defs.CLEAR_KEY = {16, 1}
 
 defs.FADE = 0.05
 defs.MAX_LEN = 60.0
-defs.MIN_LEN = 0.01
-defs.PHASE_STEPS = 64
+defs.MIN_LEN = 0.1
+defs.PHASE_STEPS = 256
 
 -- -------------------------------------------------------------------------
 -- VALUE MAPS
